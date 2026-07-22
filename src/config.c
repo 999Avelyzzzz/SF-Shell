@@ -34,8 +34,17 @@ static const char *CONF_DEFAULT =
     "# cover, ritagliando l'eccedenza) su TUTTI i monitor.\n"
     "# Per dare uno sfondo diverso a un monitor specifico usa il nome del\n"
     "# connector (es. DP-1, HDMI-A-1, eDP-1): wallpaper-DP-1 = /path/img.png\n"
-    "# La chiave per-monitor ha priorita' sul wallpaper generale.\n"
-    "wallpaper =\n";
+    "#\n"
+    "# wallpaper-extended: UNA immagine panoramica (larga) distribuita in modo\n"
+    "# continuo su TUTTI i monitor. La posizione dei monitor viene letta da\n"
+    "# Hyprland, quindi ogni schermo mostra la sua porzione dell'immagine:\n"
+    "# ideale per i setup a doppio monitor. Un eventuale wallpaper-<CONNECTOR>\n"
+    "# specifico ha comunque la precedenza sul singolo monitor.\n"
+    "#\n"
+    "# Priorita' per monitor: wallpaper-<CONNECTOR> > wallpaper-extended >\n"
+    "# wallpaper.\n"
+    "wallpaper =\n"
+    "wallpaper-extended =\n";
 
 static char           *conf_path;
 static char           *default_icon_theme;   /* tema di sistema, catturato */

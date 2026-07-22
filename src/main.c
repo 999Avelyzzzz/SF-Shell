@@ -1,5 +1,6 @@
 #include "bar.h"
 #include "config.h"
+#include "fonts.h"
 #include "wallpaper.h"
 
 /* CSS di default, stile "menu bar macOS": sfondo trasparente, niente pill,
@@ -331,6 +332,9 @@ static void on_activate(GtkApplication *app, gpointer user_data)
 
 int main(int argc, char **argv)
 {
+    /* Prima di GTK/Pango: restringe fontconfig ai soli font locali. */
+    fonts_init();
+
     GtkApplication *app = gtk_application_new("dev.sfshell.bar",
                                               G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
