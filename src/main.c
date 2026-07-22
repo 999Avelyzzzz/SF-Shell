@@ -1,7 +1,11 @@
 #include "bar.h"
+#include "colors.h"
 #include "config.h"
 #include "fonts.h"
+#include "launcher.h"
 #include "wallpaper.h"
+
+#include <string.h>
 
 /* CSS di default, stile "menu bar macOS": sfondo trasparente, niente pill,
  * solo testo. Il colore di stato dei workspace va sul numero stesso.
@@ -14,14 +18,25 @@ static const char *DEFAULT_CSS =
     "  background-color: transparent;\n"
     "}\n"
     "\n"
-    ".bar {\n"
-    "  /* Ombra sfumata: scura in alto, si dissolve fino a trasparente in basso.\n"
-    "     Non e' un layer nero uniforme, e' un degrade dall'alto verso il basso. */\n"
+    "/* Backdrop: copre barra (32px) + coda d'ombra (40px). Il gradiente scorre\n"
+    "   su tutta l'altezza, cosi' l'ombra ha spazio per dissolversi in modo\n"
+    "   molto morbido sopra il desktop. Colore SEMPRE nero, a prescindere dalla\n"
+    "   palette generata dai wallpaper: il testo mantiene lo stesso contrasto. */\n"
+    ".bar-backdrop {\n"
     "  background-image: linear-gradient(to bottom,\n"
-    "                    rgba(0, 0, 0, 0.80) 0%,\n"
-    "                    rgba(0, 0, 0, 0.48) 55%,\n"
-    "                    transparent 100%);\n"
+    "                    rgba(0, 0, 0, 0.85) 0%,\n"
+    "                    rgba(0, 0, 0, 0.60) 20%,\n"
+    "                    rgba(0, 0, 0, 0.32) 40%,\n"
+    "                    rgba(0, 0, 0, 0.14) 60%,\n"
+    "                    rgba(0, 0, 0, 0.05) 80%,\n"
+    "                    rgba(0, 0, 0, 0.00) 100%);\n"
+    "}\n"
+    "\n"
+    ".bar {\n"
+    "  background-color: transparent;\n"
     "  color: @theme_fg_color;\n"
+    "  /* Ombra sul testo: stacca le label dallo sfondo del wallpaper. */\n"
+    "  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);\n"
     "  padding: 0 10px;\n"
     "  /* Font stile macOS. L'altezza NON si mette qui: e' fissa nel codice. */\n"
     "  font-family: \"SF Pro Text\", \"SF Pro Display\", \"SF Pro\", sans-serif;\n"
@@ -239,33 +254,18 @@ static const char *DEFAULT_CSS =
     "  font-size: 12px;\n"
     "}\n";
 
-static GtkCssProvider *user_provider = NULL;
-static char           *user_css_path = NULL;
-
-/* Ricarica il CSS utente dal file (o lo svuota se il file non esiste). */
-static void reload_user_css(void)
-{
-    if (!user_provider || !user_css_path)
-        return;
-
-    if (g_file_test(user_css_path, G_FILE_TEST_EXISTS))
-        gtk_css_provider_load_from_path(user_provider, user_css_path);
-    else
-        gtk_css_provider_load_from_string(user_provider, "");
-}
-
 static void on_config_changed(GFileMonitor *monitor G_GNUC_UNUSED,
                               GFile *file, GFile *other G_GNUC_UNUSED,
                               GFileMonitorEvent event G_GNUC_UNUSED,
                               gpointer user_data G_GNUC_UNUSED)
 {
-    /* Filtra i file rilevanti nella cartella monitorata. */
+    /* Lo stile della barra e' embeddato e non modificabile: qui reagiamo solo
+     * alle modifiche del file di configurazione. */
     char *name = g_file_get_basename(file);
-    if (g_strcmp0(name, "style.css") == 0)
-        reload_user_css();
-    else if (g_strcmp0(name, config_basename()) == 0) {
+    if (g_strcmp0(name, config_basename()) == 0) {
         config_reload();
         wallpaper_reload();     /* riapplica gli sfondi se sono cambiati */
+        colors_reload();        /* rigenera la palette se serve           */
     }
     g_free(name);
 }
@@ -274,8 +274,7 @@ static void setup_style(void)
 {
     GdkDisplay *display = gdk_display_get_default();
 
-    /* Base embeddata (priorita' APPLICATION): garantisce il funzionamento
-     * anche se l'utente rimuove regole dal proprio file. */
+    /* Stile della barra: embeddato e NON modificabile dall'utente. */
     GtkCssProvider *base = gtk_css_provider_new();
     gtk_css_provider_load_from_string(base, DEFAULT_CSS);
     gtk_style_context_add_provider_for_display(
@@ -283,22 +282,11 @@ static void setup_style(void)
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(base);
 
-    /* Cartella di config + file di stile editabile (creato al primo avvio). */
+    /* Cartella di config (per il file di configurazione, non lo stile). */
     char *dir = g_build_filename(g_get_user_config_dir(), "sfshell", NULL);
     g_mkdir_with_parents(dir, 0755);
-    user_css_path = g_build_filename(dir, "style.css", NULL);
-    if (!g_file_test(user_css_path, G_FILE_TEST_EXISTS))
-        g_file_set_contents(user_css_path, DEFAULT_CSS, -1, NULL);
 
-    /* Override utente (priorita' USER, piu' alta della base). */
-    user_provider = gtk_css_provider_new();
-    gtk_style_context_add_provider_for_display(
-        display, GTK_STYLE_PROVIDER(user_provider),
-        GTK_STYLE_PROVIDER_PRIORITY_USER);
-    reload_user_css();
-
-    /* LOCK: altezza barra fissa a SFSHELL_BAR_HEIGHT, a priorita' PIU' ALTA
-     * di USER -> nessuna regola nel file style.css puo' sovrascriverla. */
+    /* LOCK: altezza barra fissa a SFSHELL_BAR_HEIGHT. */
     GtkCssProvider *lock = gtk_css_provider_new();
     char *lock_css = g_strdup_printf(
         ".bar { min-height: %dpx; }", SFSHELL_BAR_HEIGHT);
@@ -321,23 +309,99 @@ static void setup_style(void)
     g_free(dir);
 }
 
-static void on_activate(GtkApplication *app, gpointer user_data)
+/* Costruisce la shell (barra + wallpaper + palette). Chiamata una sola volta
+ * nell'istanza primaria. */
+static gboolean shell_up = FALSE;
+
+static void build_shell(GtkApplication *app)
 {
-    (void) user_data;
+    if (shell_up)
+        return;
     config_init();
     setup_style();
+    colors_init();          /* palette dai wallpaper (se abilitata) */
     wallpaper_init();
     bar_new(app);
+    shell_up = TRUE;
+}
+
+static void print_help(const char *argv0)
+{
+    g_print(
+        "SFShell — barra/shell per Hyprland (Wayland, gtk4-layer-shell)\n"
+        "\n"
+        "Uso:\n"
+        "  %s <comando>\n"
+        "\n"
+        "Comandi:\n"
+        "  run        Avvia la shell (barra, wallpaper, launcher).\n"
+        "  launcher   Apre/chiude il launcher nella shell in esecuzione,\n"
+        "             comodo da bindare in Hyprland.\n"
+        "  help       Mostra questo aiuto.\n"
+        "\n"
+        "Esempio (Hyprland):\n"
+        "  exec-once = %s run\n"
+        "  bind = SUPER, Space, exec, %s launcher\n",
+        argv0, argv0, argv0);
+}
+
+/* Gestisce ogni invocazione (locale o inoltrata dall'istanza remota) tramite
+ * la command line: cosi' `sfshell launcher` lanciato da un secondo processo
+ * viene inoltrato alla shell gia' in esecuzione, che apre il launcher. */
+static int on_command_line(GApplication *app, GApplicationCommandLine *cl,
+                           gpointer user_data G_GNUC_UNUSED)
+{
+    int argc = 0;
+    char **argv = g_application_command_line_get_arguments(cl, &argc);
+    const char *cmd = (argc >= 2) ? argv[1] : "run";
+
+    int status = 0;
+    if (g_strcmp0(cmd, "launcher") == 0) {
+        if (!shell_up) {
+            /* Nessuna shell in esecuzione: questa invocazione e' diventata lei
+             * stessa l'istanza primaria. Non avviamo una shell "fantasma". */
+            g_application_command_line_printerr(cl,
+                "sfshell: la shell non e' in esecuzione. "
+                "Avviala con 'sfshell run'.\n");
+            status = 1;
+        } else {
+            launcher_toggle();
+        }
+    } else {
+        /* "run" (o default): avvia la shell se non gia' su. */
+        build_shell(GTK_APPLICATION(app));
+    }
+
+    g_strfreev(argv);
+    g_application_command_line_set_exit_status(cl, status);
+    return status;
 }
 
 int main(int argc, char **argv)
 {
+    const char *cmd = (argc >= 2) ? argv[1] : NULL;
+
+    /* Nessun argomento o help -> stampa l'aiuto e basta (non avvia nulla). */
+    if (!cmd || strcmp(cmd, "help") == 0 ||
+        strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
+        print_help(argv[0]);
+        return 0;
+    }
+
+    if (strcmp(cmd, "run") != 0 && strcmp(cmd, "launcher") != 0) {
+        g_printerr("sfshell: comando sconosciuto '%s'\n\n", cmd);
+        print_help(argv[0]);
+        return 2;
+    }
+
     /* Prima di GTK/Pango: restringe fontconfig ai soli font locali. */
     fonts_init();
 
+    /* HANDLES_COMMAND_LINE: le invocazioni successive vengono inoltrate
+     * all'istanza primaria (la shell), che decide cosa fare del comando. */
     GtkApplication *app = gtk_application_new("dev.sfshell.bar",
-                                              G_APPLICATION_DEFAULT_FLAGS);
-    g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
+                                              G_APPLICATION_HANDLES_COMMAND_LINE);
+    g_signal_connect(app, "command-line", G_CALLBACK(on_command_line), NULL);
 
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);

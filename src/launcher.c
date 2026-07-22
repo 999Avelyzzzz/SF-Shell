@@ -1,7 +1,9 @@
 #include "launcher.h"
+#include "fuzzy.h"
 #include <gtk4-layer-shell.h>
 #include <gio/gio.h>
 #include <string.h>
+#include <math.h>
 
 /* ========================================================================
  *  App launcher stile Launchpad (macOS Tahoe):
@@ -17,6 +19,31 @@
 #define CELL_W    96
 #define CELL_H    104
 
+/* Tetto ai risultati mostrati durante una ricerca (primi N per punteggio). */
+#define LAUNCHER_MAX_RESULTS 8
+
+/* Rilevanza: si mostrano solo i risultati "veri". Soglia assoluta (sotto =
+ * rumore, non un match) e finestra relativa al miglior punteggio (mostra le
+ * alternative vicine al migliore, es. chrome/chromium). Valori tarabili. */
+#define LAUNCHER_MIN_SCORE 0.30
+#define LAUNCHER_REL_GAP   0.40
+
+/* Dati precalcolati per cella: nomi in minuscolo (per il match fuzzy) e
+ * l'ultimo punteggio calcolato. */
+typedef struct {
+    char  *name_lc;
+    char  *id_lc;
+    double score;
+} Cell;
+
+static void cell_free(gpointer p)
+{
+    Cell *c = p;
+    g_free(c->name_lc);
+    g_free(c->id_lc);
+    g_free(c);
+}
+
 /* Durata dell'animazione di chiusura (deve coprire la transizione CSS
  * piu' lunga tra velo e pannello). */
 #define LAUNCHER_CLOSE_MS 340
@@ -26,9 +53,15 @@ static GtkWidget *l_backdrop; /* velo scuro a tutto schermo              */
 static GtkWidget *l_panel;    /* pannello centrale (ricerca + griglia)   */
 static GtkWidget *l_search;   /* GtkSearchEntry                          */
 static GtkWidget *l_grid;     /* GtkFlowBox con le celle app             */
+static GtkWidget *l_scroll;   /* GtkScrolledWindow che contiene la griglia */
 static GtkWidget *l_button;   /* tasto nella barra (per lo stato active) */
 static char      *l_query;    /* testo di ricerca (lowercase)            */
 static guint      l_close_timer; /* timer del fade-out di chiusura        */
+
+/* Stato della ricerca fuzzy. */
+static gboolean         l_searching;  /* TRUE se c'e' un pattern in corso  */
+static double           l_cutoff;     /* rivela le celle con score >= cutoff */
+static GtkFlowBoxChild *l_best;       /* miglior risultato (per Invio)      */
 
 /* ---- Lancio app --------------------------------------------------------- */
 
@@ -77,25 +110,170 @@ static void on_child_activated(GtkFlowBox *box G_GNUC_UNUSED,
 
 /* ---- Ricerca ------------------------------------------------------------ */
 
+/* Mostra la cella solo se il suo punteggio rientra tra i migliori (>= cutoff).
+ * Senza pattern il cutoff e' negativo, quindi si vedono tutte. */
 static gboolean filter_cell(GtkFlowBoxChild *child, gpointer u G_GNUC_UNUSED)
 {
-    if (!l_query || !*l_query)
-        return TRUE;
-    const char *name = g_object_get_data(G_OBJECT(child), "name-lc");
-    return name && strstr(name, l_query) != NULL;
+    Cell *c = g_object_get_data(G_OBJECT(child), "cell");
+    return c && c->score >= l_cutoff;
+}
+
+/* Ordina: durante la ricerca per punteggio decrescente (miglior match in
+ * testa), altrimenti in ordine alfabetico. */
+static int sort_cell(GtkFlowBoxChild *a, GtkFlowBoxChild *b,
+                     gpointer u G_GNUC_UNUSED)
+{
+    Cell *ca = g_object_get_data(G_OBJECT(a), "cell");
+    Cell *cb = g_object_get_data(G_OBJECT(b), "cell");
+    if (!ca || !cb)
+        return 0;
+    if (l_searching) {
+        if (cb->score > ca->score) return 1;
+        if (cb->score < ca->score) return -1;
+    }
+    return g_utf8_collate(ca->name_lc, cb->name_lc);
+}
+
+static int cmp_double_desc(const void *a, const void *b)
+{
+    double da = *(const double *) a, db = *(const double *) b;
+    return (db > da) - (db < da);
+}
+
+/* Punteggio fuzzy dell'app rispetto al pattern: massimo tra nome e app-id,
+ * come Application.match() di material-you (le keyword la' sono penalizzate a
+ * tal punto da non contare mai, quindi qui bastano nome e id). */
+static double cell_match(const Cell *c, const char *pattern)
+{
+    double s = fuzzy_score(c->name_lc, pattern);
+    if (c->id_lc) {
+        double sid = fuzzy_score(c->id_lc, pattern);
+        if (sid > s) s = sid;
+    }
+    return s;
+}
+
+/* Dispone la griglia in base al numero di risultati visibili:
+ *  - n <= 0 (nessuna ricerca): griglia piena 4-righe che scorre in orizzontale;
+ *  - in ricerca: blocco CENTRATO nel launcher, celle della solita dimensione.
+ *    Colonne = n fino a 3, poi ceil(sqrt(n)) per una forma piu' quadrata:
+ *      1->1, 2->2, 3->3, 4->2x2, 5->3+2, 6->3x2, ... sempre centrate. */
+static void apply_result_layout(int n)
+{
+    GtkFlowBox *fb = GTK_FLOW_BOX(l_grid);
+    if (n <= 0) {
+        gtk_orientable_set_orientation(GTK_ORIENTABLE(fb),
+                                       GTK_ORIENTATION_VERTICAL);
+        gtk_flow_box_set_min_children_per_line(fb, GRID_ROWS);
+        gtk_flow_box_set_max_children_per_line(fb, GRID_ROWS);
+        gtk_widget_set_halign(l_grid, GTK_ALIGN_FILL);
+        gtk_widget_set_valign(l_grid, GTK_ALIGN_FILL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(l_scroll),
+                                       GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+    } else {
+        int cols = (n <= 3) ? n : (int) ceil(sqrt((double) n));
+        gtk_orientable_set_orientation(GTK_ORIENTABLE(fb),
+                                       GTK_ORIENTATION_HORIZONTAL);
+        gtk_flow_box_set_min_children_per_line(fb, cols);
+        gtk_flow_box_set_max_children_per_line(fb, cols);
+        gtk_widget_set_halign(l_grid, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(l_grid, GTK_ALIGN_CENTER);
+        /* Pochi risultati: niente scroll, cosi' il blocco resta centrato. */
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(l_scroll),
+                                       GTK_POLICY_NEVER, GTK_POLICY_NEVER);
+    }
+}
+
+/* Azzera lo stato di ricerca: tutte le celle visibili, ordine alfabetico. */
+static void search_reset(void)
+{
+    l_searching = FALSE;
+    l_cutoff = -1.0;
+    l_best = NULL;
+    for (int i = 0; ; i++) {
+        GtkFlowBoxChild *ch =
+            gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
+        if (!ch) break;
+        Cell *c = g_object_get_data(G_OBJECT(ch), "cell");
+        if (c) c->score = 0.0;
+    }
+    apply_result_layout(0);
+    gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(l_grid));
+    gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(l_grid));
 }
 
 static void on_search_changed(GtkSearchEntry *entry, gpointer u G_GNUC_UNUSED)
 {
     g_free(l_query);
     l_query = g_utf8_strdown(gtk_editable_get_text(GTK_EDITABLE(entry)), -1);
+
+    char *pat = g_strstrip(g_strdup(l_query ? l_query : ""));
+    if (!*pat) {
+        g_free(pat);
+        search_reset();
+        return;
+    }
+
+    l_searching = TRUE;
+    l_best = NULL;
+
+    /* Calcola il punteggio di ogni cella e raccogli i valori per la soglia. */
+    GArray *scores = g_array_new(FALSE, FALSE, sizeof(double));
+    double best_score = -1.0;
+    for (int i = 0; ; i++) {
+        GtkFlowBoxChild *ch =
+            gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
+        if (!ch) break;
+        Cell *c = g_object_get_data(G_OBJECT(ch), "cell");
+        if (!c) continue;
+        c->score = cell_match(c, pat);
+        g_array_append_val(scores, c->score);
+        if (c->score > best_score) {
+            best_score = c->score;
+            l_best = ch;
+        }
+    }
+
+    /* Punteggio che delimita i primi N (tetto massimo di risultati). */
+    double eighth = 0.0;
+    if (scores->len > 0) {
+        qsort(scores->data, scores->len, sizeof(double), cmp_double_desc);
+        guint k = MIN((guint) LAUNCHER_MAX_RESULTS, scores->len);
+        eighth = g_array_index(scores, double, k - 1);
+    }
+    g_array_free(scores, TRUE);
+    g_free(pat);
+
+    /* Soglia finale = max(soglia assoluta, migliore - finestra, tetto top-N).
+     * Se nemmeno il migliore raggiunge la soglia assoluta, non passa nulla. */
+    l_cutoff = LAUNCHER_MIN_SCORE;
+    double rel = best_score - LAUNCHER_REL_GAP;
+    if (rel > l_cutoff)    l_cutoff = rel;
+    if (eighth > l_cutoff) l_cutoff = eighth;
+
+    /* Conta i risultati che passano, per centrarli con la forma giusta. */
+    int nvis = 0;
+    for (int i = 0; ; i++) {
+        GtkFlowBoxChild *ch =
+            gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
+        if (!ch) break;
+        Cell *c = g_object_get_data(G_OBJECT(ch), "cell");
+        if (c && c->score >= l_cutoff) nvis++;
+    }
+
+    apply_result_layout(nvis);
     gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(l_grid));
+    gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(l_grid));
 }
 
-/* Invio nella ricerca: lancia la prima app visibile. */
+/* Invio nella ricerca: lancia il miglior risultato (o la prima cella visibile). */
 static void on_search_activate(GtkSearchEntry *entry G_GNUC_UNUSED,
                                gpointer u G_GNUC_UNUSED)
 {
+    if (l_best && gtk_widget_get_child_visible(GTK_WIDGET(l_best))) {
+        launch_app(g_object_get_data(G_OBJECT(l_best), "app"));
+        return;
+    }
     for (int i = 0; ; i++) {
         GtkFlowBoxChild *c =
             gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
@@ -159,15 +337,19 @@ static void populate_grid(void)
         GtkWidget *cell = make_cell(app);
         gtk_flow_box_append(GTK_FLOW_BOX(l_grid), cell);
 
-        /* Il child creato dal FlowBox: ci appendiamo app + nome lowercase. */
+        /* Il child creato dal FlowBox: ci appendiamo app + dati per il match. */
         GtkFlowBoxChild *child =
             GTK_FLOW_BOX_CHILD(gtk_widget_get_parent(cell));
         gtk_widget_add_css_class(GTK_WIDGET(child), "launcher-cell-wrap");
         g_object_set_data_full(G_OBJECT(child), "app",
                                g_object_ref(app), g_object_unref);
+
+        Cell *c = g_new0(Cell, 1);
         const char *name = g_app_info_get_display_name(app);
-        g_object_set_data_full(G_OBJECT(child), "name-lc",
-                               g_utf8_strdown(name ? name : "", -1), g_free);
+        c->name_lc = g_utf8_strdown(name ? name : "", -1);
+        const char *id = g_app_info_get_id(app);
+        c->id_lc = id ? g_utf8_strdown(id, -1) : NULL;
+        g_object_set_data_full(G_OBJECT(child), "cell", c, cell_free);
     }
 
     g_list_free_full(apps, g_object_unref);
@@ -282,6 +464,7 @@ static void build_popup(void)
     /* Griglia a 4 righe FISSE che cresce verso destra: si scrolla in
      * orizzontale (flowbox in orientamento VERTICALE = righe per colonna). */
     GtkWidget *scroll = gtk_scrolled_window_new();
+    l_scroll = scroll;
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
     gtk_widget_set_size_request(scroll,
@@ -302,6 +485,8 @@ static void build_popup(void)
     gtk_flow_box_set_activate_on_single_click(GTK_FLOW_BOX(l_grid), TRUE);
     gtk_flow_box_set_filter_func(GTK_FLOW_BOX(l_grid),
                                  filter_cell, NULL, NULL);
+    gtk_flow_box_set_sort_func(GTK_FLOW_BOX(l_grid),
+                               sort_cell, NULL, NULL);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), l_grid);
     g_signal_connect(l_grid, "child-activated",
                      G_CALLBACK(on_child_activated), NULL);
@@ -366,7 +551,7 @@ static void on_toggle(GtkButton *b G_GNUC_UNUSED, gpointer u G_GNUC_UNUSED)
     gtk_editable_set_text(GTK_EDITABLE(l_search), "");
     g_free(l_query);
     l_query = NULL;
-    gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(l_grid));
+    search_reset();
 
     if (l_button)
         gtk_widget_add_css_class(l_button, "active");
@@ -375,6 +560,11 @@ static void on_toggle(GtkButton *b G_GNUC_UNUSED, gpointer u G_GNUC_UNUSED)
     gtk_window_present(GTK_WINDOW(l_popup));
     gtk_widget_grab_focus(l_search);
     g_timeout_add_once(40, open_anim_cb, NULL);
+}
+
+void launcher_toggle(void)
+{
+    on_toggle(NULL, NULL);
 }
 
 static void test_open_once(gpointer btn)

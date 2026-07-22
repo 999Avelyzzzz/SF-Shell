@@ -1,4 +1,5 @@
 #include "bar.h"
+#include "config.h"
 #include "workspaces.h"
 #include "tray.h"
 #include "media.h"
@@ -7,9 +8,14 @@
 
 /* ---- Clock -------------------------------------------------------------- */
 
-/* Formatta data e ora nel layout "Sat Jul 11 19:31":
- * giorno-settimana e mese abbreviati (in inglese, a prescindere dalla locale),
- * giorno senza zero iniziale, ora 24h. */
+/* Formatta data e ora nel layout "Sat Jul 11 19:31" (24h) oppure
+ * "Sat Jul 11 7:31 PM" (12h). Giorno-settimana e mese abbreviati (in inglese,
+ * a prescindere dalla locale), giorno senza zero iniziale.
+ * Config (sfshell.conf, hot-reload):
+ *   clock_format = 24h | 12h          (default 24h)
+ *   clock_ampm   = am/pm | AM/PM | a.m/p.m | A.M/P.M  (solo 12h, default AM/PM)
+ * Il suffisso am/pm e' preso alla lettera dalla chiave: la parte prima di '/'
+ * per il mattino, quella dopo per il pomeriggio (qualsiasi stile funziona). */
 static char *clock_format_now(void)
 {
     static const char *const wdays[]  = { "Mon", "Tue", "Wed", "Thu",
@@ -26,8 +32,26 @@ static char *clock_format_now(void)
     int hour   = g_date_time_get_hour(now);
     int minute = g_date_time_get_minute(now);
 
-    char *out = g_strdup_printf("%s %s %d %02d:%02d",
-                                wday, month, day, hour, minute);
+    char *out;
+    if (g_strcmp0(config_get("clock_format"), "12h") == 0) {
+        int h12 = hour % 12;
+        if (h12 == 0) h12 = 12;
+
+        const char *style = config_get("clock_ampm");
+        if (!style) style = "AM/PM";
+        char **parts = g_strsplit(style, "/", 2);
+        gboolean valid = parts[0] && parts[1];
+        const char *suffix = (hour >= 12)
+            ? (valid ? parts[1] : "PM")
+            : (valid ? parts[0] : "AM");
+
+        out = g_strdup_printf("%s %s %d %d:%02d %s",
+                              wday, month, day, h12, minute, suffix);
+        g_strfreev(parts);
+    } else {
+        out = g_strdup_printf("%s %s %d %02d:%02d",
+                              wday, month, day, hour, minute);
+    }
 
     g_date_time_unref(now);
     return out;
@@ -91,7 +115,14 @@ GtkWindow *bar_new(GtkApplication *app)
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_TOP, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
-    gtk_layer_auto_exclusive_zone_enable(GTK_WINDOW(win));
+    /* Riserva SOLO l'altezza della barra: la coda d'ombra sotto sconfina sul
+     * desktop senza rubargli spazio. */
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(win), SFSHELL_BAR_HEIGHT);
+
+    /* Contenitore che porta il gradiente su tutta l'altezza (barra + coda):
+     * cosi' l'ombra ha spazio per dissolversi in modo morbido. */
+    GtkWidget *backdrop = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(backdrop, "bar-backdrop");
 
     /* Tre zone (sinistra / centro / destra): per ora usiamo solo la destra. */
     GtkWidget *bar = gtk_center_box_new();
@@ -116,7 +147,15 @@ GtkWindow *bar_new(GtkApplication *app)
     gtk_box_append(GTK_BOX(right), build_clock_pill());
     gtk_center_box_set_end_widget(GTK_CENTER_BOX(bar), right);
 
-    gtk_window_set_child(GTK_WINDOW(win), bar);
+    /* Barra in cima al backdrop, poi la coda d'ombra (spaziatore) che estende
+     * il gradiente verso il basso sopra il desktop. */
+    gtk_box_append(GTK_BOX(backdrop), bar);
+    GtkWidget *shadow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(shadow, "bar-shadow");
+    gtk_widget_set_size_request(shadow, -1, SFSHELL_BAR_SHADOW);
+    gtk_box_append(GTK_BOX(backdrop), shadow);
+
+    gtk_window_set_child(GTK_WINDOW(win), backdrop);
     gtk_window_present(GTK_WINDOW(win));
 
     return GTK_WINDOW(win);

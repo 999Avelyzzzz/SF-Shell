@@ -61,7 +61,12 @@ static void on_ws_clicked(GtkButton *btn, gpointer user_data)
 {
     Workspaces *ws = user_data;
     int id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(btn), "ws-id"));
-    char *req = g_strdup_printf("dispatch workspace %d", id);
+    /* Hyprland (>= 0.56) espone i dispatcher come API Lua sul socket comandi:
+     * il vecchio "dispatch workspace N" ora viene interpretato come Lua e
+     * fallisce. La forma corretta per andare a un workspace e'
+     * `dispatch hl.dsp.focus{workspace=N}` (il socket lo esegue come
+     * `hl.dispatch(hl.dsp.focus{workspace=N})`), che risponde "ok". */
+    char *req = g_strdup_printf("dispatch hl.dsp.focus{workspace=%d}", id);
     char *reply = hypr_request(ws->cmd_path, req);
     g_free(reply);
     g_free(req);

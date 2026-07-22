@@ -16,3 +16,6 @@ const char *config_basename(void);
 /* Valore grezzo di una chiave, o NULL se assente/vuota. Il puntatore e'
  * valido finche' non avviene un config_reload(). */
 const char *config_get(const char *key);
+
+/* Array NULL-terminato (g_strfreev) delle chiavi che iniziano con prefix. */
+char **config_keys_with_prefix(const char *prefix);
