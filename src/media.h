@@ -1,5 +1,5 @@
-#ifndef ASHELL_MEDIA_H
-#define ASHELL_MEDIA_H
+#ifndef SFSHELL_MEDIA_H
+#define SFSHELL_MEDIA_H
 
 #include <gtk/gtk.h>
 
@@ -7,4 +7,4 @@
  * indietro / play-pausa / avanti. Si nasconde se non c'e' nessun player. */
 GtkWidget *media_new(void);
 
-#endif /* ASHELL_MEDIA_H */
+#endif /* SFSHELL_MEDIA_H */

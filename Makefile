@@ -5,7 +5,7 @@ LDFLAGS += $(shell pkg-config --libs $(PKGS))
 
 SRC = $(wildcard src/*.c)
 OBJ = $(SRC:.c=.o)
-BIN = ashell
+BIN = sfshell
 
 $(BIN): $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)

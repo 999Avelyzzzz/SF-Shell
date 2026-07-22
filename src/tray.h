@@ -1,5 +1,5 @@
-#ifndef ASHELL_TRAY_H
-#define ASHELL_TRAY_H
+#ifndef SFSHELL_TRAY_H
+#define SFSHELL_TRAY_H
 
 #include <gtk/gtk.h>
 
@@ -8,4 +8,4 @@
  * La freccia ruota con animazione e mostra/nasconde le icone in tray. */
 GtkWidget *tray_new(void);
 
-#endif /* ASHELL_TRAY_H */
+#endif /* SFSHELL_TRAY_H */

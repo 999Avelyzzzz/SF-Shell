@@ -31,6 +31,7 @@ static GtkWidget       *g_revealer;    /* revealer delle icone              */
 static GtkWidget       *g_toggle;      /* bottone freccia                   */
 static guint            g_close_timer; /* timeout auto-chiusura             */
 static int              g_menu_open;   /* numero di menu contestuali aperti */
+static gboolean         g_pointer_inside; /* puntatore sopra il tray         */
 
 typedef struct {
     char      *bus;        /* nome del bus del servizio                     */
@@ -75,11 +76,15 @@ static void tray_cancel_close(void)
     }
 }
 
-/* (Ri)avvia il conto alla rovescia: solo se il tray e' aperto e nessun
- * menu contestuale e' attivo. */
+/* (Ri)avvia il conto alla rovescia: solo se il tray e' aperto, nessun menu
+ * contestuale e' attivo e il puntatore NON e' sopra il tray. Finche' il
+ * mouse resta sulla freccia o su un'icona il tray non si ricompatta, anche
+ * se il puntatore e' fermo (nessun evento di movimento). */
 static void tray_schedule_close(void)
 {
     tray_cancel_close();
+    if (g_pointer_inside)
+        return;
     if (g_menu_open <= 0 && g_revealer
         && gtk_revealer_get_reveal_child(GTK_REVEALER(g_revealer)))
         g_close_timer = g_timeout_add(TRAY_CLOSE_MS, close_timer_cb, NULL);
@@ -792,18 +797,21 @@ static void on_toggle(GtkButton *btn, gpointer user_data)
     }
 }
 
-/* Interazione col tray (movimento del puntatore): resetta il conto. */
-static void on_tray_motion(GtkEventControllerMotion *c G_GNUC_UNUSED,
-                           double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
-                           gpointer ud G_GNUC_UNUSED)
+/* Il puntatore entra nel tray (freccia o icone): niente auto-chiusura finche'
+ * resta sopra, anche se fermo. */
+static void on_tray_enter(GtkEventControllerMotion *c G_GNUC_UNUSED,
+                          double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
+                          gpointer ud G_GNUC_UNUSED)
 {
-    tray_schedule_close();
+    g_pointer_inside = TRUE;
+    tray_cancel_close();
 }
 
 /* Il puntatore lascia il tray: avvia il conto alla rovescia. */
 static void on_tray_leave(GtkEventControllerMotion *c G_GNUC_UNUSED,
                           gpointer ud G_GNUC_UNUSED)
 {
+    g_pointer_inside = FALSE;
     tray_schedule_close();
 }
 
@@ -837,9 +845,11 @@ GtkWidget *tray_new(void)
     gtk_box_append(GTK_BOX(box), revealer);
     gtk_box_append(GTK_BOX(box), toggle);
 
-    /* Movimento/uscita del puntatore sul tray -> resetta l'auto-chiusura. */
+    /* Entrata/uscita del puntatore sul tray -> sospende/riavvia l'auto-chiusura.
+     * enter/leave coprono l'intera area del tray (freccia + icone, figli
+     * inclusi): finche' il mouse e' sopra non si ricompatta. */
     GtkEventController *motion = gtk_event_controller_motion_new();
-    g_signal_connect(motion, "motion", G_CALLBACK(on_tray_motion), NULL);
+    g_signal_connect(motion, "enter", G_CALLBACK(on_tray_enter), NULL);
     g_signal_connect(motion, "leave", G_CALLBACK(on_tray_leave), NULL);
     gtk_widget_add_controller(box, motion);
 

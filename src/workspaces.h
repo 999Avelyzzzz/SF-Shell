@@ -1,5 +1,5 @@
-#ifndef ASHELL_WORKSPACES_H
-#define ASHELL_WORKSPACES_H
+#ifndef SFSHELL_WORKSPACES_H
+#define SFSHELL_WORKSPACES_H
 
 #include <gtk/gtk.h>
 
@@ -7,4 +7,4 @@
  * aggiorna live ascoltando il socket eventi di Hyprland. */
 GtkWidget *workspaces_new(void);
 
-#endif /* ASHELL_WORKSPACES_H */
+#endif /* SFSHELL_WORKSPACES_H */

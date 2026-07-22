@@ -2,7 +2,7 @@
 #include <string.h>
 
 /* ========================================================================
- *  Config file ~/.config/ashell/ashell.conf, formato "chiave = valore"
+ *  Config file ~/.config/sfshell/sfshell.conf, formato "chiave = valore"
  *  (righe vuote e '#' = commento). Chiavi:
  *    icon_theme       icon pack per le icone delle app
  *    overlay_color    colore del velo dietro il launcher (nome CSS o #rrggbb)
@@ -11,10 +11,10 @@
  *  ogni valore; il GFileMonitor su main.c la richiama ad ogni modifica.
  * ======================================================================== */
 
-#define CONF_BASENAME "ashell.conf"
+#define CONF_BASENAME "sfshell.conf"
 
 static const char *CONF_DEFAULT =
-    "# Configurazione di AShell\n"
+    "# Configurazione di SFShell\n"
     "#\n"
     "# icon_theme: nome dell'icon pack (icon theme) per le icone delle app,\n"
     "# es. Papirus, WhiteSur, breeze, Adwaita. Deve corrispondere a una\n"
@@ -27,7 +27,15 @@ static const char *CONF_DEFAULT =
     "# overlay_color: colore del velo, qualsiasi colore CSS (nome o #rrggbb).\n"
     "# overlay_opacity: quanto e' trasparente, 0.0 (invisibile) .. 1.0 (pieno).\n"
     "overlay_color = #000000\n"
-    "overlay_opacity = 0.35\n";
+    "overlay_opacity = 0.35\n"
+    "\n"
+    "# --- Wallpaper ---\n"
+    "# wallpaper: percorso dell'immagine di sfondo. Viene riempita (filled/\n"
+    "# cover, ritagliando l'eccedenza) su TUTTI i monitor.\n"
+    "# Per dare uno sfondo diverso a un monitor specifico usa il nome del\n"
+    "# connector (es. DP-1, HDMI-A-1, eDP-1): wallpaper-DP-1 = /path/img.png\n"
+    "# La chiave per-monitor ha priorita' sul wallpaper generale.\n"
+    "wallpaper =\n";
 
 static char           *conf_path;
 static char           *default_icon_theme;   /* tema di sistema, catturato */
@@ -37,6 +45,16 @@ static GHashTable     *conf_values;           /* chiave -> valore           */
 const char *config_basename(void)
 {
     return CONF_BASENAME;
+}
+
+const char *config_get(const char *key)
+{
+    if (conf_values) {
+        const char *v = g_hash_table_lookup(conf_values, key);
+        if (v && *v)
+            return v;
+    }
+    return NULL;
 }
 
 /* Valore di una chiave, o fallback se assente/vuota. */
@@ -134,7 +152,7 @@ void config_reload(void)
 
 void config_init(void)
 {
-    char *dir = g_build_filename(g_get_user_config_dir(), "ashell", NULL);
+    char *dir = g_build_filename(g_get_user_config_dir(), "sfshell", NULL);
     g_mkdir_with_parents(dir, 0755);
     conf_path = g_build_filename(dir, CONF_BASENAME, NULL);
     if (!g_file_test(conf_path, G_FILE_TEST_EXISTS))

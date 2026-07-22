@@ -1,9 +1,10 @@
 #include "bar.h"
 #include "config.h"
+#include "wallpaper.h"
 
 /* CSS di default, stile "menu bar macOS": sfondo trasparente, niente pill,
  * solo testo. Il colore di stato dei workspace va sul numero stesso.
- * Alla prima esecuzione viene scritto in ~/.config/ashell/style.css, poi
+ * Alla prima esecuzione viene scritto in ~/.config/sfshell/style.css, poi
  * quel file e' ricaricato a caldo ad ogni modifica: si puo' cambiare
  * qualsiasi cosa senza riavviare. */
 static const char *DEFAULT_CSS =
@@ -154,13 +155,19 @@ static const char *DEFAULT_CSS =
     "  background-color: @theme_selected_bg_color;\n"
     "  transform: scale(1.12);\n"
     "}\n"
+    "/* Launcher aperto: pallino sempre nel colore active dominante,\n"
+    "   a prescindere dall'hover (stato .active messo dal toggle). */\n"
+    ".launcher-btn.active .launcher-dot {\n"
+    "  background-color: @theme_selected_bg_color;\n"
+    "  transform: scale(1.12);\n"
+    "}\n"
     "\n"
     "/* Popup overlay: velo scuro a tutto schermo. */\n"
     ".launcher-popup {\n"
     "  background-color: transparent;\n"
     "}\n"
     "/* Velo: SOLO fade in/out (nessuno scale). Il gradient a bordi sfumati\n"
-    "   e' iniettato da config; il colore/opacita' da ashell.conf. */\n"
+    "   e' iniettato da config; il colore/opacita' da sfshell.conf. */\n"
     ".launcher-backdrop {\n"
     "  background-color: transparent;\n"
     "  transition: opacity 300ms ease;\n"
@@ -255,8 +262,10 @@ static void on_config_changed(GFileMonitor *monitor G_GNUC_UNUSED,
     char *name = g_file_get_basename(file);
     if (g_strcmp0(name, "style.css") == 0)
         reload_user_css();
-    else if (g_strcmp0(name, config_basename()) == 0)
+    else if (g_strcmp0(name, config_basename()) == 0) {
         config_reload();
+        wallpaper_reload();     /* riapplica gli sfondi se sono cambiati */
+    }
     g_free(name);
 }
 
@@ -274,7 +283,7 @@ static void setup_style(void)
     g_object_unref(base);
 
     /* Cartella di config + file di stile editabile (creato al primo avvio). */
-    char *dir = g_build_filename(g_get_user_config_dir(), "ashell", NULL);
+    char *dir = g_build_filename(g_get_user_config_dir(), "sfshell", NULL);
     g_mkdir_with_parents(dir, 0755);
     user_css_path = g_build_filename(dir, "style.css", NULL);
     if (!g_file_test(user_css_path, G_FILE_TEST_EXISTS))
@@ -287,11 +296,11 @@ static void setup_style(void)
         GTK_STYLE_PROVIDER_PRIORITY_USER);
     reload_user_css();
 
-    /* LOCK: altezza barra fissa a ASHELL_BAR_HEIGHT, a priorita' PIU' ALTA
+    /* LOCK: altezza barra fissa a SFSHELL_BAR_HEIGHT, a priorita' PIU' ALTA
      * di USER -> nessuna regola nel file style.css puo' sovrascriverla. */
     GtkCssProvider *lock = gtk_css_provider_new();
     char *lock_css = g_strdup_printf(
-        ".bar { min-height: %dpx; }", ASHELL_BAR_HEIGHT);
+        ".bar { min-height: %dpx; }", SFSHELL_BAR_HEIGHT);
     gtk_css_provider_load_from_string(lock, lock_css);
     gtk_style_context_add_provider_for_display(
         display, GTK_STYLE_PROVIDER(lock),
@@ -316,12 +325,13 @@ static void on_activate(GtkApplication *app, gpointer user_data)
     (void) user_data;
     config_init();
     setup_style();
+    wallpaper_init();
     bar_new(app);
 }
 
 int main(int argc, char **argv)
 {
-    GtkApplication *app = gtk_application_new("dev.ashell.bar",
+    GtkApplication *app = gtk_application_new("dev.sfshell.bar",
                                               G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
 

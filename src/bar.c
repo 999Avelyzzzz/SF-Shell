@@ -83,8 +83,11 @@ GtkWindow *bar_new(GtkApplication *app)
 
     /* Layer shell: barra ancorata in alto, riservando spazio (exclusive). */
     gtk_layer_init_for_window(GTK_WINDOW(win));
-    gtk_layer_set_layer(GTK_WINDOW(win), GTK_LAYER_SHELL_LAYER_TOP);
-    gtk_layer_set_namespace(GTK_WINDOW(win), "ashell-bar");
+    /* OVERLAY (sopra il velo del launcher, che sta su TOP): cosi' il velo
+     * scuro passa ANCHE sotto la barra e la barra resta visibile sopra, con
+     * la sua ombra che si stacca sul velo. */
+    gtk_layer_set_layer(GTK_WINDOW(win), GTK_LAYER_SHELL_LAYER_OVERLAY);
+    gtk_layer_set_namespace(GTK_WINDOW(win), "sfshell-bar");
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_TOP, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
@@ -94,7 +97,7 @@ GtkWindow *bar_new(GtkApplication *app)
     GtkWidget *bar = gtk_center_box_new();
     gtk_widget_add_css_class(bar, "bar");
     /* Altezza fissa imposta nel codice (rinforzata dal provider CSS lock). */
-    gtk_widget_set_size_request(bar, -1, ASHELL_BAR_HEIGHT);
+    gtk_widget_set_size_request(bar, -1, SFSHELL_BAR_HEIGHT);
     gtk_widget_set_vexpand(bar, FALSE);
 
     /* Zona sinistra: bottone launcher + media player. */

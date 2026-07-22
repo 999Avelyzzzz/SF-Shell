@@ -26,6 +26,7 @@ static GtkWidget *l_backdrop; /* velo scuro a tutto schermo              */
 static GtkWidget *l_panel;    /* pannello centrale (ricerca + griglia)   */
 static GtkWidget *l_search;   /* GtkSearchEntry                          */
 static GtkWidget *l_grid;     /* GtkFlowBox con le celle app             */
+static GtkWidget *l_button;   /* tasto nella barra (per lo stato active) */
 static char      *l_query;    /* testo di ricerca (lowercase)            */
 static guint      l_close_timer; /* timer del fade-out di chiusura        */
 
@@ -49,6 +50,8 @@ static void launcher_hide(void)
 {
     if (!l_popup || !gtk_widget_get_visible(l_popup) || l_close_timer)
         return;
+    if (l_button)
+        gtk_widget_remove_css_class(l_button, "active");
     gtk_widget_add_css_class(l_backdrop, "closing");
     gtk_widget_add_css_class(l_panel, "closing");
     l_close_timer = g_timeout_add_once(LAUNCHER_CLOSE_MS,
@@ -220,18 +223,29 @@ static void build_popup(void)
     gtk_widget_add_css_class(l_popup, "launcher-popup");
 
     gtk_layer_init_for_window(GTK_WINDOW(l_popup));
-    gtk_layer_set_layer(GTK_WINDOW(l_popup), GTK_LAYER_SHELL_LAYER_OVERLAY);
-    gtk_layer_set_namespace(GTK_WINDOW(l_popup), "ashell-launcher");
+    /* TOP, sotto la barra (OVERLAY): il velo copre tutto lo schermo, barra
+     * inclusa, ma la barra resta visibile sopra al velo. */
+    gtk_layer_set_layer(GTK_WINDOW(l_popup), GTK_LAYER_SHELL_LAYER_TOP);
+    gtk_layer_set_namespace(GTK_WINDOW(l_popup), "sfshell-launcher");
     gtk_layer_set_anchor(GTK_WINDOW(l_popup), GTK_LAYER_SHELL_EDGE_TOP, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(l_popup), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(l_popup), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(l_popup), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
+    /* -1 = il velo ignora l'exclusive zone della barra e si estende ANCHE
+     * dietro di essa (prima partiva sotto la barra, lasciando una striscia
+     * non oscurata in alto). */
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(l_popup), -1);
+    /* ON_DEMAND (non EXCLUSIVE): il launcher prende la tastiera quando e'
+     * focato (per la ricerca), ma NON tiene un grab esclusivo. Con EXCLUSIVE
+     * il compositor consumava il click sul tasto della barra come tentativo
+     * di focus, per cui il secondo click nella stessa posizione non arrivava
+     * mai al bottone e il launcher non si chiudeva. */
     gtk_layer_set_keyboard_mode(GTK_WINDOW(l_popup),
-                                GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE);
+                                GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
 
-    /* Velo scuro a tutto schermo (sotto il pannello, e sotto la barra: la
-     * finestra overlay rispetta l'exclusive zone della barra e parte sotto
-     * di essa). Colore/opacita' da ashell.conf; si espande dal centro. */
+    /* Velo scuro a tutto schermo (sotto il pannello). Copre l'intero output,
+     * barra compresa (la barra vive su un layer superiore e resta visibile
+     * sopra). Colore/opacita' da sfshell.conf; si espande dal centro. */
     GtkWidget *backdrop = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     l_backdrop = backdrop;
     gtk_widget_add_css_class(backdrop, "launcher-backdrop");
@@ -300,8 +314,11 @@ static void build_popup(void)
 
     populate_grid();
 
-    /* Escape chiude. */
+    /* Escape chiude. Fase CAPTURE: il popup vede il tasto PRIMA del campo di
+     * ricerca (che ha il focus e altrimenti "mangerebbe" Escape), cosi' ESC
+     * chiude sempre il launcher a prescindere dal focus. */
     GtkEventController *key = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(key, GTK_PHASE_CAPTURE);
     g_signal_connect(key, "key-pressed", G_CALLBACK(on_key), NULL);
     gtk_widget_add_controller(l_popup, key);
 
@@ -351,6 +368,8 @@ static void on_toggle(GtkButton *b G_GNUC_UNUSED, gpointer u G_GNUC_UNUSED)
     l_query = NULL;
     gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(l_grid));
 
+    if (l_button)
+        gtk_widget_add_css_class(l_button, "active");
     gtk_widget_add_css_class(l_backdrop, "opening");
     gtk_widget_add_css_class(l_panel, "opening");
     gtk_window_present(GTK_WINDOW(l_popup));
@@ -366,6 +385,7 @@ static void test_open_once(gpointer btn)
 GtkWidget *launcher_button_new(void)
 {
     GtkWidget *btn = gtk_button_new();
+    l_button = btn;
     gtk_widget_add_css_class(btn, "launcher-btn");
     gtk_widget_set_focusable(btn, FALSE);
     gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
@@ -376,8 +396,8 @@ GtkWidget *launcher_button_new(void)
 
     g_signal_connect(btn, "clicked", G_CALLBACK(on_toggle), NULL);
 
-    /* Hook di debug: apre il launcher all'avvio se ASHELL_LAUNCHER_TEST=1. */
-    if (g_strcmp0(g_getenv("ASHELL_LAUNCHER_TEST"), "1") == 0)
+    /* Hook di debug: apre il launcher all'avvio se SFSHELL_LAUNCHER_TEST=1. */
+    if (g_strcmp0(g_getenv("SFSHELL_LAUNCHER_TEST"), "1") == 0)
         g_timeout_add_once(600, test_open_once, btn);
 
     return btn;
