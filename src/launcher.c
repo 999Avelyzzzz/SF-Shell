@@ -1,8 +1,8 @@
 #include "launcher.h"
 #include "fuzzy.h"
+#include "config.h"
 #include <gtk4-layer-shell.h>
 #include <gio/gio.h>
-#include <gio/gunixsocketaddress.h>
 #include <string.h>
 #include <math.h>
 
@@ -50,6 +50,7 @@ static void cell_free(gpointer p)
 #define LAUNCHER_CLOSE_MS 340
 
 static GtkWidget *l_popup;    /* finestra layer-shell overlay (una sola) */
+static GtkWidget *l_blur_bg;  /* wallpaper sfocato a tutto schermo (fondo) */
 static GtkWidget *l_backdrop; /* velo scuro a tutto schermo              */
 static GtkWidget *l_panel;    /* pannello centrale (ricerca + griglia)   */
 static GtkWidget *l_search;   /* GtkSearchEntry                          */
@@ -72,6 +73,8 @@ static void launcher_do_hide(gpointer u G_GNUC_UNUSED)
     l_close_timer = 0;
     if (l_popup)
         gtk_widget_set_visible(l_popup, FALSE);
+    if (l_blur_bg)
+        gtk_widget_remove_css_class(l_blur_bg, "closing");
     if (l_backdrop)
         gtk_widget_remove_css_class(l_backdrop, "closing");
     if (l_panel)
@@ -86,6 +89,8 @@ static void launcher_hide(void)
         return;
     if (l_button)
         gtk_widget_remove_css_class(l_button, "active");
+    if (l_blur_bg)
+        gtk_widget_add_css_class(l_blur_bg, "closing");
     gtk_widget_add_css_class(l_backdrop, "closing");
     gtk_widget_add_css_class(l_panel, "closing");
     l_close_timer = g_timeout_add_once(LAUNCHER_CLOSE_MS,
@@ -398,55 +403,44 @@ static gboolean on_scroll(GtkEventControllerScroll *c G_GNUC_UNUSED,
     return TRUE;
 }
 
-/* ---- Blur del compositor ------------------------------------------------ */
+/* ---- Sfondo sfocato (blur puro GTK4) ------------------------------------ */
 
-/* GTK4 non ha backdrop-filter: la sfocatura dietro il pannello puo' darla solo
- * il compositor. Su Hyprland chiediamo (best-effort, one-shot) di sfocare il
- * layer del launcher tramite una layerrule sul nostro namespace. Se Hyprland
- * non c'e', non fa nulla. Per renderlo permanente aggiungi a hyprland.conf:
- *   layerrule = blur, sfshell-launcher
- * L'invio a runtime evita di dover toccare la config, ma non sopravvive a un
- * riavvio del compositor. */
-static void hypr_enable_blur(void)
+/* Percorso del wallpaper da sfocare come sfondo del launcher. GTK4 non puo'
+ * campionare cio' che il compositor disegna dietro la layer-surface (lo vieta
+ * Wayland), quindi sfochiamo cio' che la shell stessa possiede: il wallpaper.
+ * Preferenza: 'wallpaper' generico, poi 'wallpaper-extended', infine la prima
+ * chiave 'wallpaper-<CONNECTOR>' disponibile. NULL se nessuno e' impostato. */
+static const char *blur_wallpaper_path(void)
 {
-    const char *sig = g_getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    if (!sig)
+    const char *p = config_get("wallpaper");
+    if (p && *p)
+        return p;
+    p = config_get("wallpaper-extended");
+    if (p && *p)
+        return p;
+
+    const char *found = NULL;
+    char **keys = config_keys_with_prefix("wallpaper-");
+    for (int i = 0; keys[i]; i++) {
+        const char *v = config_get(keys[i]);
+        if (v && *v) { found = v; break; }
+    }
+    g_strfreev(keys);
+    return found;   /* punta al valore in config (stabile fino al reload) */
+}
+
+/* (Ri)carica il wallpaper nella GtkPicture di sfondo. La sfocatura vera e' data
+ * dal CSS 'filter: blur()' su .launcher-blur-bg: qui carichiamo solo l'immagine
+ * nitida, che GTK sfoca a GPU in fase di rendering. */
+static void blur_bg_refresh(void)
+{
+    if (!l_blur_bg)
         return;
-
-    char *path = g_build_filename(g_get_user_runtime_dir(), "hypr", sig,
-                                  ".socket.sock", NULL);
-    GSocketAddress *addr = g_unix_socket_address_new(path);
-    GSocket *sock = g_socket_new(G_SOCKET_FAMILY_UNIX, G_SOCKET_TYPE_STREAM,
-                                 G_SOCKET_PROTOCOL_DEFAULT, NULL);
-
-    /* Una keyword per comando: registriamo la regola di blur sul namespace. */
-    static const char *const cmds[] = {
-        "keyword layerrule blur,sfshell-launcher",
-        "keyword layerrule ignorealpha 0.0,sfshell-launcher",
-        NULL
-    };
-    if (sock && g_socket_connect(sock, addr, NULL, NULL)) {
-        for (int i = 0; cmds[i]; i++) {
-            /* Riconnessione per ogni comando: il socket comandi risponde e
-             * chiude a ogni richiesta. */
-            GSocket *s = (i == 0) ? sock
-                : g_socket_new(G_SOCKET_FAMILY_UNIX, G_SOCKET_TYPE_STREAM,
-                               G_SOCKET_PROTOCOL_DEFAULT, NULL);
-            if (s && (i == 0 || g_socket_connect(s, addr, NULL, NULL)))
-                g_socket_send(s, cmds[i], strlen(cmds[i]), NULL, NULL);
-            if (i != 0 && s) {
-                g_socket_close(s, NULL);
-                g_object_unref(s);
-            }
-        }
-    }
-
-    if (sock) {
-        g_socket_close(sock, NULL);
-        g_object_unref(sock);
-    }
-    g_object_unref(addr);
-    g_free(path);
+    const char *wp = blur_wallpaper_path();
+    if (wp)
+        gtk_picture_set_filename(GTK_PICTURE(l_blur_bg), wp);
+    else
+        gtk_picture_set_paintable(GTK_PICTURE(l_blur_bg), NULL);
 }
 
 /* ---- Costruzione popup -------------------------------------------------- */
@@ -477,9 +471,20 @@ static void build_popup(void)
     gtk_layer_set_keyboard_mode(GTK_WINDOW(l_popup),
                                 GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
 
-    /* Chiedi al compositor di sfocare dietro il launcher (frosted glass).
-     * Prima che la finestra venga mappata (present avviene dopo). */
-    hypr_enable_blur();
+    /* Overlay: sotto tutto il wallpaper sfocato, sopra il velo + pannello. */
+    GtkWidget *root = gtk_overlay_new();
+    gtk_window_set_child(GTK_WINDOW(l_popup), root);
+
+    /* Sfondo sfocato: GtkPicture col wallpaper (COVER), sfocato via CSS
+     * 'filter: blur()' su .launcher-blur-bg. E' cio' che da' l'effetto frosted
+     * dietro il pannello, tutto in GTK4/C senza il compositor. */
+    l_blur_bg = gtk_picture_new();
+    gtk_widget_add_css_class(l_blur_bg, "launcher-blur-bg");
+    gtk_widget_add_css_class(l_blur_bg, "opening");
+    gtk_picture_set_content_fit(GTK_PICTURE(l_blur_bg), GTK_CONTENT_FIT_COVER);
+    gtk_picture_set_can_shrink(GTK_PICTURE(l_blur_bg), TRUE);
+    blur_bg_refresh();
+    gtk_overlay_set_child(GTK_OVERLAY(root), l_blur_bg);
 
     /* Velo scuro a tutto schermo (sotto il pannello). Copre l'intero output,
      * barra compresa (la barra vive su un layer superiore e resta visibile
@@ -488,7 +493,7 @@ static void build_popup(void)
     l_backdrop = backdrop;
     gtk_widget_add_css_class(backdrop, "launcher-backdrop");
     gtk_widget_add_css_class(backdrop, "opening");
-    gtk_window_set_child(GTK_WINDOW(l_popup), backdrop);
+    gtk_overlay_add_overlay(GTK_OVERLAY(root), backdrop);
 
     /* Pannello centrale traslucido: vexpand+valign CENTER lo mette al
      * centro verticale (un GtkBox altrimenti impacchetta in alto). */
@@ -577,6 +582,8 @@ static void build_popup(void)
  * il present, cosi' lo stato iniziale viene disegnato almeno una volta. */
 static void open_anim_cb(gpointer u G_GNUC_UNUSED)
 {
+    if (l_blur_bg)
+        gtk_widget_remove_css_class(l_blur_bg, "opening");
     if (l_backdrop)
         gtk_widget_remove_css_class(l_backdrop, "opening");
     if (l_panel)
@@ -599,6 +606,8 @@ static void on_toggle(GtkButton *b G_GNUC_UNUSED, gpointer u G_GNUC_UNUSED)
         g_source_remove(l_close_timer);
         l_close_timer = 0;
     }
+    if (l_blur_bg)
+        gtk_widget_remove_css_class(l_blur_bg, "closing");
     gtk_widget_remove_css_class(l_backdrop, "closing");
     gtk_widget_remove_css_class(l_panel, "closing");
 
@@ -608,9 +617,12 @@ static void on_toggle(GtkButton *b G_GNUC_UNUSED, gpointer u G_GNUC_UNUSED)
     g_free(l_query);
     l_query = NULL;
     search_reset();
+    blur_bg_refresh();      /* riprende il wallpaper corrente (hot-reload) */
 
     if (l_button)
         gtk_widget_add_css_class(l_button, "active");
+    if (l_blur_bg)
+        gtk_widget_add_css_class(l_blur_bg, "opening");
     gtk_widget_add_css_class(l_backdrop, "opening");
     gtk_widget_add_css_class(l_panel, "opening");
     gtk_window_present(GTK_WINDOW(l_popup));
