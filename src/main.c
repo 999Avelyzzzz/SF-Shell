@@ -2,6 +2,7 @@
 #include "colors.h"
 #include "config.h"
 #include "fonts.h"
+#include "fullscreen.h"
 #include "launcher.h"
 #include "wallpaper.h"
 
@@ -199,7 +200,7 @@ static const char *DEFAULT_CSS =
     "/* Pannello: scala dal centro mantenendo l'aspect ratio (scale uniforme),\n"
     "   veloce e smooth (easeOutCubic). */\n"
     ".launcher-panel {\n"
-    "  background-color: alpha(@theme_bg_color, 0.55);\n"
+    "  background-color: alpha(@theme_bg_color, 0.82);\n"
     "  border-radius: 22px;\n"
     "  padding: 18px;\n"
     "  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);\n"
@@ -321,7 +322,8 @@ static void build_shell(GtkApplication *app)
     setup_style();
     colors_init();          /* palette dai wallpaper (se abilitata) */
     wallpaper_init();
-    bar_new(app);
+    GtkWindow *bar = bar_new(app);
+    fullscreen_watch(bar);  /* nasconde la barra sotto app fullscreen */
     shell_up = TRUE;
 }
 

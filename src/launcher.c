@@ -2,6 +2,7 @@
 #include "fuzzy.h"
 #include <gtk4-layer-shell.h>
 #include <gio/gio.h>
+#include <gio/gunixsocketaddress.h>
 #include <string.h>
 #include <math.h>
 
@@ -397,6 +398,57 @@ static gboolean on_scroll(GtkEventControllerScroll *c G_GNUC_UNUSED,
     return TRUE;
 }
 
+/* ---- Blur del compositor ------------------------------------------------ */
+
+/* GTK4 non ha backdrop-filter: la sfocatura dietro il pannello puo' darla solo
+ * il compositor. Su Hyprland chiediamo (best-effort, one-shot) di sfocare il
+ * layer del launcher tramite una layerrule sul nostro namespace. Se Hyprland
+ * non c'e', non fa nulla. Per renderlo permanente aggiungi a hyprland.conf:
+ *   layerrule = blur, sfshell-launcher
+ * L'invio a runtime evita di dover toccare la config, ma non sopravvive a un
+ * riavvio del compositor. */
+static void hypr_enable_blur(void)
+{
+    const char *sig = g_getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (!sig)
+        return;
+
+    char *path = g_build_filename(g_get_user_runtime_dir(), "hypr", sig,
+                                  ".socket.sock", NULL);
+    GSocketAddress *addr = g_unix_socket_address_new(path);
+    GSocket *sock = g_socket_new(G_SOCKET_FAMILY_UNIX, G_SOCKET_TYPE_STREAM,
+                                 G_SOCKET_PROTOCOL_DEFAULT, NULL);
+
+    /* Una keyword per comando: registriamo la regola di blur sul namespace. */
+    static const char *const cmds[] = {
+        "keyword layerrule blur,sfshell-launcher",
+        "keyword layerrule ignorealpha 0.0,sfshell-launcher",
+        NULL
+    };
+    if (sock && g_socket_connect(sock, addr, NULL, NULL)) {
+        for (int i = 0; cmds[i]; i++) {
+            /* Riconnessione per ogni comando: il socket comandi risponde e
+             * chiude a ogni richiesta. */
+            GSocket *s = (i == 0) ? sock
+                : g_socket_new(G_SOCKET_FAMILY_UNIX, G_SOCKET_TYPE_STREAM,
+                               G_SOCKET_PROTOCOL_DEFAULT, NULL);
+            if (s && (i == 0 || g_socket_connect(s, addr, NULL, NULL)))
+                g_socket_send(s, cmds[i], strlen(cmds[i]), NULL, NULL);
+            if (i != 0 && s) {
+                g_socket_close(s, NULL);
+                g_object_unref(s);
+            }
+        }
+    }
+
+    if (sock) {
+        g_socket_close(sock, NULL);
+        g_object_unref(sock);
+    }
+    g_object_unref(addr);
+    g_free(path);
+}
+
 /* ---- Costruzione popup -------------------------------------------------- */
 
 static void build_popup(void)
@@ -424,6 +476,10 @@ static void build_popup(void)
      * mai al bottone e il launcher non si chiudeva. */
     gtk_layer_set_keyboard_mode(GTK_WINDOW(l_popup),
                                 GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
+
+    /* Chiedi al compositor di sfocare dietro il launcher (frosted glass).
+     * Prima che la finestra venga mappata (present avviene dopo). */
+    hypr_enable_blur();
 
     /* Velo scuro a tutto schermo (sotto il pannello). Copre l'intero output,
      * barra compresa (la barra vive su un layer superiore e resta visibile

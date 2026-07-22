@@ -23,6 +23,11 @@ static const char *CONF_DEFAULT =
     "# ereditati e infine a hicolor. Lascia vuoto per il tema di sistema.\n"
     "icon_theme =\n"
     "\n"
+    "# --- Top bar ---\n"
+    "# bar_shadow: ombra/gradiente scuro dietro la barra (sfuma sul desktop).\n"
+    "# true = visibile (default), false = barra su fondo trasparente.\n"
+    "bar_shadow = true\n"
+    "\n"
     "# --- Orologio ---\n"
     "# clock_format: 24h (es. 19:31) oppure 12h (es. 7:31 PM). Default 24h.\n"
     "# clock_ampm: stile del suffisso mattino/pomeriggio, usato solo con 12h.\n"
@@ -36,6 +41,8 @@ static const char *CONF_DEFAULT =
     "# Tre modi di impostare lo sfondo (priorita' per monitor:\n"
     "#   wallpaper-<CONNECTOR>  >  wallpaper-extended  >  wallpaper).\n"
     "# Di default e' attivo solo 'wallpaper'; gli altri sono esempi commentati.\n"
+    "# Nei percorsi puoi usare ~ e le variabili d'ambiente ($HOME, ${HOME}, ...),\n"
+    "# es. wallpaper = ~/Immagini/sfondo.jpg oppure $HOME/Immagini/sfondo.jpg.\n"
     "#\n"
     "# wallpaper: UNA immagine riempita (cover, ritaglia l'eccedenza) su TUTTI\n"
     "# i monitor. E' l'impostazione base.\n"
@@ -66,6 +73,7 @@ static const char *CONF_DEFAULT =
 static char           *conf_path;
 static char           *default_icon_theme;   /* tema di sistema, catturato */
 static GtkCssProvider *overlay_provider;      /* CSS del velo (hot)         */
+static GtkCssProvider *bar_provider;          /* CSS della barra (hot)      */
 static GHashTable     *conf_values;           /* chiave -> valore           */
 
 const char *config_basename(void)
@@ -110,6 +118,65 @@ static const char *conf_get(const char *key, const char *fallback)
     return fallback;
 }
 
+/* Espande la ~ iniziale e le variabili d'ambiente ($VAR, ${VAR}) nel valore,
+ * cosi' i path in sfshell.conf possono usare ~, $HOME, ${HOME}, ecc. Ritorna
+ * una nuova stringa (da liberare con g_free). Applicata a TUTTI i valori: le
+ * chiavi non-path non contengono ne' ~ ne' $, quindi restano immutate. */
+static char *expand_value(const char *val)
+{
+    if (!val || !*val)
+        return g_strdup(val ? val : "");
+
+    GString *out = g_string_new(NULL);
+    const char *p = val;
+
+    /* Tilde iniziale: "~" da solo o "~/..." -> home dell'utente. */
+    if (p[0] == '~' && (p[1] == '\0' || p[1] == '/')) {
+        g_string_append(out, g_get_home_dir());
+        p++;                       /* consuma la ~, lascia l'eventuale '/' */
+    }
+
+    /* Variabili d'ambiente nel resto della stringa. */
+    for (; *p; p++) {
+        if (*p != '$') {
+            g_string_append_c(out, *p);
+            continue;
+        }
+
+        const char *name_start;
+        gsize name_len;
+        if (p[1] == '{') {                     /* forma ${VAR} */
+            name_start = p + 2;
+            const char *end = strchr(name_start, '}');
+            if (!end) {                        /* '${' non chiuso: letterale */
+                g_string_append_c(out, '$');
+                continue;
+            }
+            name_len = (gsize) (end - name_start);
+            p = end;                           /* il for salta oltre '}'     */
+        } else {                               /* forma $VAR */
+            name_start = p + 1;
+            const char *q = name_start;
+            while (g_ascii_isalnum(*q) || *q == '_')
+                q++;
+            name_len = (gsize) (q - name_start);
+            if (name_len == 0) {               /* '$' isolato: letterale     */
+                g_string_append_c(out, '$');
+                continue;
+            }
+            p = q - 1;                         /* il for riparte da q        */
+        }
+
+        char *name = g_strndup(name_start, name_len);
+        const char *env = g_getenv(name);
+        if (env)
+            g_string_append(out, env);         /* var mancante -> stringa vuota */
+        g_free(name);
+    }
+
+    return g_string_free(out, FALSE);
+}
+
 /* Rilegge il file in conf_values (sostituendo la tabella precedente). */
 static void parse_file(void)
 {
@@ -134,7 +201,7 @@ static void parse_file(void)
         char *key = g_strstrip(line);
         char *val = g_strstrip(eq + 1);
         if (*key)
-            g_hash_table_insert(conf_values, g_strdup(key), g_strdup(val));
+            g_hash_table_insert(conf_values, g_strdup(key), expand_value(val));
     }
     g_strfreev(lines);
     g_free(content);
@@ -183,11 +250,40 @@ static void apply_overlay(void)
     g_free(css);
 }
 
+/* Interpreta un valore come booleano: true/1/on/yes = vero (case-insensitive).
+ * Qualsiasi altra cosa (o assente) usa il default passato. */
+static gboolean conf_get_bool(const char *key, gboolean fallback)
+{
+    const char *v = conf_get(key, NULL);
+    if (!v)
+        return fallback;
+    return g_ascii_strcasecmp(v, "true") == 0 ||
+           g_ascii_strcasecmp(v, "1")    == 0 ||
+           g_ascii_strcasecmp(v, "on")   == 0 ||
+           g_ascii_strcasecmp(v, "yes")  == 0;
+}
+
+/* Gradiente/ombra dietro la top bar (.bar-backdrop): attivo di default. Con
+ * `bar_shadow = false` in sfshell.conf lo togliamo, sovrascrivendo lo sfondo
+ * del backdrop con "nessuno" (barra su fondo pienamente trasparente). */
+static void apply_bar_shadow(void)
+{
+    if (!bar_provider)
+        return;
+    if (conf_get_bool("bar_shadow", TRUE))
+        gtk_css_provider_load_from_string(bar_provider, "");   /* usa il default */
+    else
+        gtk_css_provider_load_from_string(bar_provider,
+            ".bar-backdrop { background-image: none;"
+            " background-color: transparent; }");
+}
+
 void config_reload(void)
 {
     parse_file();
     apply_icon_theme();
     apply_overlay();
+    apply_bar_shadow();
 }
 
 void config_init(void)
@@ -208,6 +304,12 @@ void config_init(void)
         overlay_provider = gtk_css_provider_new();
         gtk_style_context_add_provider_for_display(
             display, GTK_STYLE_PROVIDER(overlay_provider),
+            GTK_STYLE_PROVIDER_PRIORITY_USER + 2);
+        /* Provider dedicato alla barra (es. on/off dell'ombra), sopra il CSS
+         * base embeddato (APPLICATION) cosi' puo' sovrascriverne il backdrop. */
+        bar_provider = gtk_css_provider_new();
+        gtk_style_context_add_provider_for_display(
+            display, GTK_STYLE_PROVIDER(bar_provider),
             GTK_STYLE_PROVIDER_PRIORITY_USER + 2);
     }
 
