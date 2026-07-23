@@ -5,6 +5,7 @@
 #include <gtk4-layer-shell.h>
 #include <gio/gio.h>
 #include <gio/gdesktopappinfo.h>
+#include <glib/gstdio.h>
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
@@ -839,6 +840,14 @@ static GdkTexture *make_blurred_wallpaper(void)
     return tex;
 }
 
+/* Cache dello sfondo sfocato: la sfocatura (lettura da disco + decode + 6
+ * passate di box blur) e' costosa e va fatta solo quando il wallpaper cambia
+ * davvero. Memorizziamo path + mtime dell'ultimo blur: se combaciano con quelli
+ * correnti, riusiamo la texture gia' impostata sulla picture. Cosi' l'apertura
+ * del launcher e' immediata a wallpaper invariato (il caso normale). */
+static char    *l_blur_path;   /* path del wallpaper sfocato in cache        */
+static gint64   l_blur_mtime;  /* mtime del file al momento del blur          */
+
 /* Rigenera lo sfondo sfocato dal wallpaper attuale. Chiamata ad ogni apertura
  * cosi' segue eventuali cambi di wallpaper (hot-reload). Senza wallpaper la
  * picture resta vuota e trasparisce il velo scuro di fallback (CSS). */
@@ -846,11 +855,33 @@ static void launcher_refresh_blur(void)
 {
     if (!l_blur_pic)
         return;
+
+    const char *path = pick_wallpaper_path();
+
+    /* mtime corrente del wallpaper (0 se non c'e' o non si legge). */
+    gint64 mtime = 0;
+    if (path && *path) {
+        GStatBuf st;
+        if (g_stat(path, &st) == 0)
+            mtime = (gint64) st.st_mtime;
+    }
+
+    /* Stesso file, stesso mtime, texture gia' presente: niente da rifare. */
+    if (g_strcmp0(path, l_blur_path) == 0 && mtime == l_blur_mtime &&
+        gtk_picture_get_paintable(GTK_PICTURE(l_blur_pic)) != NULL)
+        return;
+
     GdkTexture *tex = make_blurred_wallpaper();
     gtk_picture_set_paintable(GTK_PICTURE(l_blur_pic),
                               tex ? GDK_PAINTABLE(tex) : NULL);
     if (tex)
         g_object_unref(tex);
+
+    /* Aggiorna la chiave di cache (anche in caso di fallimento: evita di
+     * riprovare a vuoto un wallpaper illeggibile ad ogni apertura). */
+    g_free(l_blur_path);
+    l_blur_path  = g_strdup(path);
+    l_blur_mtime = mtime;
 }
 
 /* ---- Scrollbar orizzontale custom --------------------------------------- */

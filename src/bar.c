@@ -3,6 +3,7 @@
 #include "workspaces.h"
 #include "tray.h"
 #include "media.h"
+#include "battery.h"
 #include "launcher.h"
 #include <gtk4-layer-shell.h>
 
@@ -144,10 +145,11 @@ GtkWindow *bar_new(GtkApplication *app, GdkMonitor *monitor)
 
     gtk_center_box_set_center_widget(GTK_CENTER_BOX(bar), workspaces_new());
 
-    /* Zona destra: tray, poi orologio (a destra). */
+    /* Zona destra: tray, batteria, poi orologio (a destra). */
     GtkWidget *right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_valign(right, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(right), tray_new());
+    gtk_box_append(GTK_BOX(right), battery_new());
     gtk_box_append(GTK_BOX(right), build_clock_pill());
     gtk_center_box_set_end_widget(GTK_CENTER_BOX(bar), right);
 

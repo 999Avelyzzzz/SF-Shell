@@ -83,6 +83,8 @@ static void tray_collapse(TrayView *v)
 {
     if (v->revealer)
         gtk_revealer_set_reveal_child(GTK_REVEALER(v->revealer), FALSE);
+    if (v->icons_box)
+        gtk_widget_add_css_class(v->icons_box, "collapsed");   /* fade-out */
     if (v->toggle)
         gtk_widget_remove_css_class(v->toggle, "expanded");
 }
@@ -922,6 +924,12 @@ static void on_toggle(GtkButton *btn, gpointer user_data)
     GtkRevealer *rev = GTK_REVEALER(v->revealer);
     gboolean now = !gtk_revealer_get_reveal_child(rev);
     gtk_revealer_set_reveal_child(rev, now);
+    /* Fade sincronizzato allo slide del revealer: togliere/mettere ".collapsed"
+     * fa transire l'opacita' delle icone (dissolvenza in apertura/chiusura). */
+    if (v->icons_box) {
+        if (now) gtk_widget_remove_css_class(v->icons_box, "collapsed");
+        else     gtk_widget_add_css_class(v->icons_box, "collapsed");
+    }
     if (now) {
         gtk_widget_add_css_class(GTK_WIDGET(btn), "expanded");
         tray_schedule_close(v);          /* aperto -> parte il conto */
@@ -980,6 +988,7 @@ GtkWidget *tray_new(void)
 
     v->icons_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_add_css_class(v->icons_box, "tray-icons");
+    gtk_widget_add_css_class(v->icons_box, "collapsed");   /* parte dissolto */
 
     v->revealer = gtk_revealer_new();
     gtk_revealer_set_transition_type(GTK_REVEALER(v->revealer),
