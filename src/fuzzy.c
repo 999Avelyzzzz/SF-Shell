@@ -22,9 +22,25 @@ static int lev_n(const char *a, int la, const char *b, int lb)
         int ti = la; la = lb; lb = ti;
     }
 
-    int *prev = malloc((size_t)(lb + 1) * sizeof(int));
-    int *curr = malloc((size_t)(lb + 1) * sizeof(int));
-    if (!prev || !curr) { free(prev); free(curr); return (la > lb) ? la : lb; }
+    /* Le due righe della DP: per stringhe corte (i nomi delle app lo sono
+     * quasi sempre) stanno su stack, azzerando la pressione sull'allocatore
+     * durante la ricerca live. Solo per stringhe lunghe si passa all'heap. */
+    int stack_prev[64], stack_curr[64];
+    int *heap_prev = NULL, *heap_curr = NULL;
+    int *prev, *curr;
+    if (lb + 1 <= 64) {
+        prev = stack_prev;
+        curr = stack_curr;
+    } else {
+        heap_prev = malloc((size_t)(lb + 1) * sizeof(int));
+        heap_curr = malloc((size_t)(lb + 1) * sizeof(int));
+        if (!heap_prev || !heap_curr) {
+            free(heap_prev); free(heap_curr);
+            return (la > lb) ? la : lb;
+        }
+        prev = heap_prev;
+        curr = heap_curr;
+    }
 
     for (int j = 0; j <= lb; j++)
         prev[j] = j;
@@ -42,8 +58,8 @@ static int lev_n(const char *a, int la, const char *b, int lb)
     }
 
     int result = prev[lb];
-    free(prev);
-    free(curr);
+    free(heap_prev);
+    free(heap_curr);
     return result;
 }
 

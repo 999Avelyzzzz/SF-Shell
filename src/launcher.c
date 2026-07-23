@@ -1,10 +1,13 @@
 #include "launcher.h"
 #include "fuzzy.h"
 #include "config.h"
+#include "usage.h"
 #include <gtk4-layer-shell.h>
 #include <gio/gio.h>
+#include <gio/gdesktopappinfo.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 
 /* ========================================================================
  *  App launcher stile Launchpad (macOS Tahoe):
@@ -18,7 +21,7 @@
 #define GRID_COLS 6
 #define GRID_ROWS 4
 #define CELL_W    96
-#define CELL_H    104
+#define CELL_H    82    /* icona 56 + spaziatura + label: niente vuoto sotto */
 
 /* Tetto ai risultati mostrati durante una ricerca (primi N per punteggio). */
 #define LAUNCHER_MAX_RESULTS 8
@@ -29,13 +32,25 @@
 #define LAUNCHER_MIN_SCORE 0.30
 #define LAUNCHER_REL_GAP   0.40
 
-/* Dati precalcolati per cella: nomi in minuscolo (per il match fuzzy) e
- * l'ultimo punteggio calcolato. */
+/* Dati precalcolati per cella: nomi in minuscolo (per il match fuzzy), ultimo
+ * punteggio calcolato e statistiche d'uso (per l'ordinamento della griglia). */
 typedef struct {
     char  *name_lc;
     char  *id_lc;
     double score;
+    int    use_count;   /* lanci totali (0 = mai usata)     */
+    gint64 use_last;    /* ultimo uso (epoch, secondi)      */
 } Cell;
+
+/* Chiave stabile di un'app per la cache d'uso: l'id del .desktop, con fallback
+ * al nome visualizzato. Puntatore di proprieta' del GAppInfo (non liberare). */
+static const char *app_key(GAppInfo *app)
+{
+    const char *id = g_app_info_get_id(app);
+    if (id && *id)
+        return id;
+    return g_app_info_get_display_name(app);
+}
 
 static void cell_free(gpointer p)
 {
@@ -56,9 +71,50 @@ static GtkWidget *l_panel;    /* pannello centrale (ricerca + griglia)   */
 static GtkWidget *l_search;   /* GtkSearchEntry                          */
 static GtkWidget *l_grid;     /* GtkFlowBox con le celle app             */
 static GtkWidget *l_scroll;   /* GtkScrolledWindow che contiene la griglia */
-static GtkWidget *l_button;   /* tasto nella barra (per lo stato active) */
+static GtkWidget *l_scrollbar; /* scrollbar orizzontale disegnata da noi   */
+static GPtrArray *l_buttons;  /* tasti nelle barre (uno per monitor)     */
+
+/* Scrollbar custom: pillola arrotondata su una traccia sottile, che segue
+ * l'hadjustment della griglia. Hover -> cresce/schiarisce (animato, smooth);
+ * si puo' trascinare per scorrere. Sostituisce quella di GTK (policy EXTERNAL). */
+#define SB_MARGIN     10.0   /* rientro orizzontale traccia (px)          */
+#define SB_MIN_THUMB  36.0   /* larghezza minima del cursore (px)         */
+#define SB_THICK      4.0    /* spessore a riposo (px)                    */
+#define SB_THICK_MAX  7.0    /* spessore in hover/drag (px)               */
+
+static double   l_sb_hover;        /* stato hover animato 0..1 (thumb)    */
+static gboolean l_sb_hover_target; /* hover cursore: verso dell'animazione*/
+static double   l_sb_show;         /* dissolvenza 0..1 (mouse sul launcher)*/
+static gboolean l_sb_show_target;  /* show: verso dell'animazione         */
+static guint    l_sb_anim;         /* tick callback delle animazioni      */
+static gboolean l_sb_inside;       /* puntatore sopra la scrollbar        */
+static gboolean l_over_launcher;   /* puntatore sopra il pannello launcher*/
+static gboolean l_sb_dragging;     /* trascinamento in corso              */
+static double   l_sb_grab_offset;  /* offset presa dentro il cursore (px) */
 static char      *l_query;    /* testo di ricerca (lowercase)            */
 static guint      l_close_timer; /* timer del fade-out di chiusura        */
+
+/* Cache dei GtkFlowBoxChild in ordine d'inserimento: iterarla e' O(n) senza
+ * il costo per-elemento di gtk_flow_box_get_child_at_index (che scandisce la
+ * lista dei figli, rendendo la ricerca live O(n^2)). */
+static GPtrArray *l_cells;
+
+/* Celle "riempitivo" invisibili: completano l'ultima pagina 6x4 cosi' la
+ * disposizione a colonne del FlowBox si legge per righe (impaginazione stile
+ * Launchpad). Sono figli del FlowBox ma senza icona ne' interazione. */
+static GPtrArray *l_fillers;
+
+/* Monitoraggio installazioni app: quando cambiano i .desktop la griglia va
+ * rigenerata. l_dirty = rebuild rimandato alla prossima apertura; il timer
+ * coalizza i cambi ravvicinati (installazioni che toccano piu' file). */
+static GAppInfoMonitor *l_app_monitor;
+static gboolean         l_dirty;
+static guint            l_rebuild_timer;
+
+static void rebuild_grid(void);
+static void on_search_changed(GtkSearchEntry *entry, gpointer u);
+static void sb_sync(void);
+static void relayout_pages(void);
 
 /* Stato della ricerca fuzzy. */
 static gboolean         l_searching;  /* TRUE se c'e' un pattern in corso  */
@@ -79,18 +135,60 @@ static void launcher_do_hide(gpointer u G_GNUC_UNUSED)
         gtk_widget_remove_css_class(l_panel, "closing");
 }
 
+/* Aggiunge/toglie lo stato ".active" al pallino di TUTTE le barre. */
+static void buttons_set_active(gboolean active)
+{
+    if (!l_buttons)
+        return;
+    for (guint i = 0; i < l_buttons->len; i++) {
+        GtkWidget *b = l_buttons->pdata[i];
+        if (active)
+            gtk_widget_add_css_class(b, "active");
+        else
+            gtk_widget_remove_css_class(b, "active");
+    }
+}
+
 /* Chiude con animazione: velo in fade-out, pannello che rimpicciolisce dal
  * centro; la finestra viene nascosta a transizione finita. */
 static void launcher_hide(void)
 {
     if (!l_popup || !gtk_widget_get_visible(l_popup) || l_close_timer)
         return;
-    if (l_button)
-        gtk_widget_remove_css_class(l_button, "active");
+    buttons_set_active(FALSE);
     gtk_widget_add_css_class(l_backdrop, "closing");
     gtk_widget_add_css_class(l_panel, "closing");
     l_close_timer = g_timeout_add_once(LAUNCHER_CLOSE_MS,
                                        launcher_do_hide, NULL);
+}
+
+/* Child-setup eseguito nel processo figlio tra fork ed exec: setsid() lo
+ * stacca in una NUOVA sessione (nuovo process group, senza terminale di
+ * controllo). Cosi' l'app non condivide piu' il gruppo con la shell: quando
+ * la shell viene chiusa/uccisa il figlio viene riadottato da init e NON
+ * riceve i segnali diretti al gruppo della shell -> resta viva. Equivale a
+ * un "disown". Solo funzioni async-signal-safe qui: setsid() lo e'. */
+static void launch_child_setup(gpointer u G_GNUC_UNUSED)
+{
+    setsid();
+}
+
+/* Riallinea le statistiche d'uso di ogni cella dalla cache e ri-ordina la
+ * griglia. Chiamata dopo un lancio: al prossimo (o immediato) refresh l'app
+ * appena usata sale nell'ordine. */
+static void refresh_usage_order(void)
+{
+    if (!l_cells)
+        return;
+    for (guint i = 0; i < l_cells->len; i++) {
+        GtkFlowBoxChild *ch = l_cells->pdata[i];
+        Cell *c = g_object_get_data(G_OBJECT(ch), "cell");
+        GAppInfo *app = g_object_get_data(G_OBJECT(ch), "app");
+        if (c && app)
+            usage_get(app_key(app), &c->use_count, &c->use_last);
+    }
+    if (!l_searching)
+        relayout_pages();       /* riassegna le posizioni di pagina */
 }
 
 static void launch_app(GAppInfo *app)
@@ -99,7 +197,33 @@ static void launch_app(GAppInfo *app)
         return;
     GdkDisplay *display = gdk_display_get_default();
     GdkAppLaunchContext *ctx = gdk_display_get_app_launch_context(display);
-    g_app_info_launch(app, NULL, G_APP_LAUNCH_CONTEXT(ctx), NULL);
+    GError *err = NULL;
+
+    /* I .desktop sono GDesktopAppInfo: li lanciamo "as manager" per poter
+     * imporre il child-setup (setsid) e detachare stdout/stderr, restando
+     * fedeli alla semantica del .desktop (Exec, Terminal=, DBusActivatable).
+     * Fallback al lancio generico per gli app-info non-desktop. */
+    if (G_IS_DESKTOP_APP_INFO(app)) {
+        g_desktop_app_info_launch_uris_as_manager(
+            G_DESKTOP_APP_INFO(app), NULL, G_APP_LAUNCH_CONTEXT(ctx),
+            G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL |
+                G_SPAWN_STDERR_TO_DEV_NULL,
+            launch_child_setup, NULL, NULL, NULL, &err);
+    } else {
+        g_app_info_launch(app, NULL, G_APP_LAUNCH_CONTEXT(ctx), &err);
+    }
+    gboolean ok = (err == NULL);
+    if (err) {
+        g_warning("launcher: lancio fallito: %s", err->message);
+        g_error_free(err);
+    }
+
+    /* Solo i lanci riusciti contano per l'ordinamento d'uso. */
+    if (ok) {
+        usage_bump(app_key(app));
+        refresh_usage_order();
+    }
+
     g_object_unref(ctx);
     launcher_hide();
 }
@@ -110,30 +234,104 @@ static void on_child_activated(GtkFlowBox *box G_GNUC_UNUSED,
     launch_app(g_object_get_data(G_OBJECT(child), "app"));
 }
 
-/* ---- Ricerca ------------------------------------------------------------ */
+/* ---- Ricerca / impaginazione -------------------------------------------- */
 
-/* Mostra la cella solo se il suo punteggio rientra tra i migliori (>= cutoff).
- * Senza pattern il cutoff e' negativo, quindi si vedono tutte. */
+static gboolean is_filler(GtkFlowBoxChild *child)
+{
+    return g_object_get_data(G_OBJECT(child), "filler") != NULL;
+}
+
+static int grid_pos(GtkFlowBoxChild *child)
+{
+    return GPOINTER_TO_INT(g_object_get_data(G_OBJECT(child), "gridpos"));
+}
+
+/* Visibilita' di una cella:
+ *  - riempitivi: visibili SOLO nella griglia (tengono lo slot di pagina),
+ *    nascosti in ricerca;
+ *  - app: in ricerca solo se il punteggio rientra tra i migliori (>= cutoff);
+ *    senza pattern il cutoff e' negativo, quindi si vedono tutte. */
 static gboolean filter_cell(GtkFlowBoxChild *child, gpointer u G_GNUC_UNUSED)
 {
+    if (is_filler(child))
+        return !l_searching;
     Cell *c = g_object_get_data(G_OBJECT(child), "cell");
     return c && c->score >= l_cutoff;
 }
 
-/* Ordina: durante la ricerca per punteggio decrescente (miglior match in
- * testa), altrimenti in ordine alfabetico. */
+/* Confronto per l'ordine LOGICO (usato per assegnare le posizioni di pagina):
+ * per uso (piu' lanciate prima, poi le piu' recenti), a parita' alfabetico.
+ * Senza dati d'uso (default) e' puro A-Z. */
+static int logical_cmp(gconstpointer a, gconstpointer b)
+{
+    GtkFlowBoxChild *ca_ch = *(GtkFlowBoxChild *const *) a;
+    GtkFlowBoxChild *cb_ch = *(GtkFlowBoxChild *const *) b;
+    Cell *ca = g_object_get_data(G_OBJECT(ca_ch), "cell");
+    Cell *cb = g_object_get_data(G_OBJECT(cb_ch), "cell");
+    if (!ca || !cb)
+        return 0;
+    if (ca->use_count != cb->use_count)
+        return cb->use_count - ca->use_count;
+    if (ca->use_last != cb->use_last)
+        return (cb->use_last > ca->use_last) ? 1 : -1;
+    return g_utf8_collate(ca->name_lc, cb->name_lc);
+}
+
+/* Ordina il FlowBox:
+ *  - in ricerca: per punteggio fuzzy decrescente (i riempitivi in coda);
+ *  - nella griglia: per posizione di pagina precalcolata (relayout_pages),
+ *    che rende la disposizione a colonne leggibile per righe. */
 static int sort_cell(GtkFlowBoxChild *a, GtkFlowBoxChild *b,
                      gpointer u G_GNUC_UNUSED)
 {
+    if (!l_searching)
+        return grid_pos(a) - grid_pos(b);
+
+    gboolean fa = is_filler(a), fb = is_filler(b);
+    if (fa || fb)
+        return fa - fb;                            /* riempitivi sempre in coda */
+
     Cell *ca = g_object_get_data(G_OBJECT(a), "cell");
     Cell *cb = g_object_get_data(G_OBJECT(b), "cell");
     if (!ca || !cb)
         return 0;
-    if (l_searching) {
-        if (cb->score > ca->score) return 1;
-        if (cb->score < ca->score) return -1;
-    }
+    if (cb->score > ca->score) return 1;
+    if (cb->score < ca->score) return -1;
     return g_utf8_collate(ca->name_lc, cb->name_lc);
+}
+
+/* Assegna a ogni cella la posizione nel FlowBox (colonne da GRID_ROWS) in modo
+ * che, pagina per pagina (GRID_COLS x GRID_ROWS), l'ordine logico si legga per
+ * RIGHE. I riempitivi occupano gli slot finali dell'ultima pagina. */
+static void relayout_pages(void)
+{
+    if (!l_cells || !l_grid)
+        return;
+
+    const int R = GRID_ROWS, C = GRID_COLS, PAGE = R * C;
+
+    /* Ordine logico delle app. */
+    GPtrArray *ord = g_ptr_array_new();
+    for (guint i = 0; i < l_cells->len; i++)
+        g_ptr_array_add(ord, l_cells->pdata[i]);
+    g_ptr_array_sort(ord, logical_cmp);
+
+    /* i-esima app in ordine -> slot (colonna*R + riga) per lettura a righe. */
+    guint total = ord->len + (l_fillers ? l_fillers->len : 0);
+    for (guint i = 0; i < total; i++) {
+        int p = (int) (i / PAGE);
+        int o = (int) (i % PAGE);
+        int row = o / C, col = o % C;
+        int pos = (p * C + col) * R + row;
+        GtkFlowBoxChild *ch = (i < ord->len)
+            ? ord->pdata[i]
+            : l_fillers->pdata[i - ord->len];
+        g_object_set_data(G_OBJECT(ch), "gridpos", GINT_TO_POINTER(pos));
+    }
+    g_ptr_array_free(ord, TRUE);
+
+    if (!l_searching)
+        gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(l_grid));
 }
 
 static int cmp_double_desc(const void *a, const void *b)
@@ -170,8 +368,9 @@ static void apply_result_layout(int n)
         gtk_flow_box_set_max_children_per_line(fb, GRID_ROWS);
         gtk_widget_set_halign(l_grid, GTK_ALIGN_FILL);
         gtk_widget_set_valign(l_grid, GTK_ALIGN_FILL);
+        /* EXTERNAL: scrollabile ma senza scrollbar di GTK (la nostra e' custom). */
         gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(l_scroll),
-                                       GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+                                       GTK_POLICY_EXTERNAL, GTK_POLICY_NEVER);
     } else {
         int cols = (n <= 3) ? n : (int) ceil(sqrt((double) n));
         gtk_orientable_set_orientation(GTK_ORIENTABLE(fb),
@@ -184,24 +383,22 @@ static void apply_result_layout(int n)
         gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(l_scroll),
                                        GTK_POLICY_NEVER, GTK_POLICY_NEVER);
     }
+    sb_sync();
 }
 
-/* Azzera lo stato di ricerca: tutte le celle visibili, ordine alfabetico. */
+/* Azzera lo stato di ricerca: tutte le celle visibili, impaginazione a righe. */
 static void search_reset(void)
 {
     l_searching = FALSE;
     l_cutoff = -1.0;
     l_best = NULL;
-    for (int i = 0; ; i++) {
-        GtkFlowBoxChild *ch =
-            gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
-        if (!ch) break;
-        Cell *c = g_object_get_data(G_OBJECT(ch), "cell");
+    for (guint i = 0; l_cells && i < l_cells->len; i++) {
+        Cell *c = g_object_get_data(G_OBJECT(l_cells->pdata[i]), "cell");
         if (c) c->score = 0.0;
     }
     apply_result_layout(0);
+    relayout_pages();           /* riordino per pagine (usa l'uso aggiornato) */
     gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(l_grid));
-    gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(l_grid));
 }
 
 static void on_search_changed(GtkSearchEntry *entry, gpointer u G_GNUC_UNUSED)
@@ -219,17 +416,23 @@ static void on_search_changed(GtkSearchEntry *entry, gpointer u G_GNUC_UNUSED)
     l_searching = TRUE;
     l_best = NULL;
 
-    /* Calcola il punteggio di ogni cella e raccogli i valori per la soglia. */
-    GArray *scores = g_array_new(FALSE, FALSE, sizeof(double));
+    guint n = l_cells ? l_cells->len : 0;
+
+    /* Calcola il punteggio di ogni cella e raccogli i valori per la soglia.
+     * Buffer punteggi su stack finche' le app stanno in STACK_SCORES, cosi'
+     * la ricerca live non alloca a ogni tasto. */
+    enum { STACK_SCORES = 512 };
+    double stack_scores[STACK_SCORES];
+    double *scores = (n <= STACK_SCORES) ? stack_scores
+                                         : g_new(double, n);
     double best_score = -1.0;
-    for (int i = 0; ; i++) {
-        GtkFlowBoxChild *ch =
-            gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
-        if (!ch) break;
+    guint ns = 0;
+    for (guint i = 0; i < n; i++) {
+        GtkFlowBoxChild *ch = l_cells->pdata[i];
         Cell *c = g_object_get_data(G_OBJECT(ch), "cell");
         if (!c) continue;
         c->score = cell_match(c, pat);
-        g_array_append_val(scores, c->score);
+        scores[ns++] = c->score;
         if (c->score > best_score) {
             best_score = c->score;
             l_best = ch;
@@ -238,12 +441,13 @@ static void on_search_changed(GtkSearchEntry *entry, gpointer u G_GNUC_UNUSED)
 
     /* Punteggio che delimita i primi N (tetto massimo di risultati). */
     double eighth = 0.0;
-    if (scores->len > 0) {
-        qsort(scores->data, scores->len, sizeof(double), cmp_double_desc);
-        guint k = MIN((guint) LAUNCHER_MAX_RESULTS, scores->len);
-        eighth = g_array_index(scores, double, k - 1);
+    if (ns > 0) {
+        qsort(scores, ns, sizeof(double), cmp_double_desc);
+        guint k = MIN((guint) LAUNCHER_MAX_RESULTS, ns);
+        eighth = scores[k - 1];
     }
-    g_array_free(scores, TRUE);
+    if (scores != stack_scores)
+        g_free(scores);
     g_free(pat);
 
     /* Soglia finale = max(soglia assoluta, migliore - finestra, tetto top-N).
@@ -255,11 +459,8 @@ static void on_search_changed(GtkSearchEntry *entry, gpointer u G_GNUC_UNUSED)
 
     /* Conta i risultati che passano, per centrarli con la forma giusta. */
     int nvis = 0;
-    for (int i = 0; ; i++) {
-        GtkFlowBoxChild *ch =
-            gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
-        if (!ch) break;
-        Cell *c = g_object_get_data(G_OBJECT(ch), "cell");
+    for (guint i = 0; i < n; i++) {
+        Cell *c = g_object_get_data(G_OBJECT(l_cells->pdata[i]), "cell");
         if (c && c->score >= l_cutoff) nvis++;
     }
 
@@ -269,23 +470,37 @@ static void on_search_changed(GtkSearchEntry *entry, gpointer u G_GNUC_UNUSED)
 }
 
 /* Invio nella ricerca: lancia il miglior risultato (o la prima cella visibile). */
-static void on_search_activate(GtkSearchEntry *entry G_GNUC_UNUSED,
+static void on_search_activate(GtkSearchEntry *entry,
                                gpointer u G_GNUC_UNUSED)
 {
-    if (l_best && gtk_widget_get_child_visible(GTK_WIDGET(l_best))) {
-        launch_app(g_object_get_data(G_OBJECT(l_best), "app"));
+    /* Invio "al volo": se si digita velocissimo e si preme subito, il
+     * search-changed puo' non aver ancora ricalcolato (scatta sul main loop).
+     * Se il testo corrente non combacia con l'ultima query elaborata,
+     * riallineiamo QUI, in modo sincrono, cosi' l_best riflette esattamente
+     * cio' che c'e' scritto e Invio lancia il match giusto (dolphin), non la
+     * prima cella della griglia. */
+    const char *txt = gtk_editable_get_text(GTK_EDITABLE(entry));
+    char *now = g_utf8_strdown(txt ? txt : "", -1);
+    if (g_strcmp0(now, l_query ? l_query : "") != 0)
+        on_search_changed(entry, NULL);
+    g_free(now);
+
+    /* In ricerca: lancia il miglior match, ma solo se supera davvero la soglia
+     * (altrimenti "nessun risultato" -> non aprire nulla a caso). Il controllo
+     * e' sul PUNTEGGIO, non su child_visible: quest'ultimo si aggiorna dopo il
+     * re-filtro del FlowBox (asincrono) e sarebbe ancora vecchio qui. */
+    if (l_searching) {
+        if (l_best) {
+            Cell *cb = g_object_get_data(G_OBJECT(l_best), "cell");
+            if (cb && cb->score >= l_cutoff)
+                launch_app(g_object_get_data(G_OBJECT(l_best), "app"));
+        }
         return;
     }
-    for (int i = 0; ; i++) {
-        GtkFlowBoxChild *c =
-            gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(l_grid), i);
-        if (!c)
-            break;
-        if (gtk_widget_get_child_visible(GTK_WIDGET(c))) {
-            launch_app(g_object_get_data(G_OBJECT(c), "app"));
-            return;
-        }
-    }
+
+    /* Senza ricerca (query vuota): apri la prima app della griglia. */
+    if (l_cells && l_cells->len > 0)
+        launch_app(g_object_get_data(G_OBJECT(l_cells->pdata[0]), "app"));
 }
 
 /* ---- Popolamento griglia ------------------------------------------------ */
@@ -326,6 +541,21 @@ static GtkWidget *make_cell(GAppInfo *app)
     return cell;
 }
 
+/* Cella "riempitivo": stesso ingombro di una app ma vuota e non cliccabile.
+ * Serve solo a completare l'ultima pagina 6x4 per l'impaginazione a righe. */
+static void add_filler(void)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(box, CELL_W, CELL_H);
+    gtk_widget_set_can_target(box, FALSE);
+    gtk_flow_box_append(GTK_FLOW_BOX(l_grid), box);
+
+    GtkFlowBoxChild *child = GTK_FLOW_BOX_CHILD(gtk_widget_get_parent(box));
+    gtk_widget_set_can_target(GTK_WIDGET(child), FALSE);
+    g_object_set_data(G_OBJECT(child), "filler", GINT_TO_POINTER(1));
+    g_ptr_array_add(l_fillers, child);
+}
+
 static void populate_grid(void)
 {
     GList *apps = g_app_info_get_all();
@@ -351,10 +581,69 @@ static void populate_grid(void)
         c->name_lc = g_utf8_strdown(name ? name : "", -1);
         const char *id = g_app_info_get_id(app);
         c->id_lc = id ? g_utf8_strdown(id, -1) : NULL;
+        usage_get(app_key(app), &c->use_count, &c->use_last);
         g_object_set_data_full(G_OBJECT(child), "cell", c, cell_free);
+
+        g_ptr_array_add(l_cells, child);
     }
 
     g_list_free_full(apps, g_object_unref);
+
+    /* Completa l'ultima pagina con riempitivi, cosi' il rimappaggio a righe e'
+     * esatto anche quando le app non sono un multiplo di GRID_COLS*GRID_ROWS. */
+    int page = GRID_COLS * GRID_ROWS;
+    int pad = (page - ((int) l_cells->len % page)) % page;
+    for (int i = 0; i < pad; i++)
+        add_filler();
+
+    relayout_pages();
+}
+
+/* Svuota la griglia (e la cache) prima di ripopolarla. */
+static void clear_grid(void)
+{
+    GtkWidget *ch;
+    while ((ch = gtk_widget_get_first_child(l_grid)))
+        gtk_flow_box_remove(GTK_FLOW_BOX(l_grid), ch);
+    if (l_cells)
+        g_ptr_array_set_size(l_cells, 0);
+    if (l_fillers)
+        g_ptr_array_set_size(l_fillers, 0);
+}
+
+/* Rigenera la griglia dai .desktop attuali, poi riapplica lo stato di ricerca
+ * corrente (se l'utente sta gia' cercando, la lista risultati resta coerente). */
+static void rebuild_grid(void)
+{
+    clear_grid();
+    populate_grid();
+    l_dirty = FALSE;
+
+    if (l_searching && l_query && *l_query)
+        on_search_changed(GTK_SEARCH_ENTRY(l_search), NULL);
+    else
+        search_reset();
+}
+
+static void rebuild_timeout(gpointer u G_GNUC_UNUSED)
+{
+    l_rebuild_timer = 0;
+    rebuild_grid();
+}
+
+/* I .desktop installati sono cambiati (nuova app, rimozione, aggiornamento).
+ * Se il launcher e' aperto rigeneriamo subito (con debounce per coalizzare i
+ * cambi ravvicinati); se e' chiuso segniamo solo "dirty" e rigenereremo alla
+ * prossima apertura, senza sprecare lavoro a schermo spento. */
+static void on_apps_changed(GAppInfoMonitor *m G_GNUC_UNUSED,
+                            gpointer u G_GNUC_UNUSED)
+{
+    l_dirty = TRUE;
+    if (l_popup && gtk_widget_get_visible(l_popup)) {
+        if (l_rebuild_timer)
+            g_source_remove(l_rebuild_timer);
+        l_rebuild_timer = g_timeout_add_once(300, rebuild_timeout, NULL);
+    }
 }
 
 /* ---- Chiusura (Escape / click fuori dal pannello) ----------------------- */
@@ -383,7 +672,55 @@ static void on_backdrop_click(GtkGestureClick *g G_GNUC_UNUSED, int n G_GNUC_UNU
         launcher_hide();
 }
 
-/* Rotellina verticale -> scroll orizzontale (le app vanno verso destra). */
+/* Scroll fluido della rotellina: ogni notch aggiorna un valore-obiettivo e un
+ * tick sul frame-clock avvicina dolcemente la posizione reale (nessun salto). */
+#define WHEEL_STEP     130.0   /* px per notch di rotellina                   */
+#define WHEEL_EASE     0.22    /* frazione di avvicinamento per frame         */
+
+static double   l_wheel_target;   /* posizione orizzontale desiderata (px)   */
+static gboolean l_wheel_active;   /* animazione wheel in corso               */
+static guint    l_wheel_tick;     /* tick callback dello scroll fluido       */
+
+static GtkAdjustment *scroll_hadj(void)
+{
+    return l_scroll
+        ? gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(l_scroll))
+        : NULL;
+}
+
+/* Ferma lo scroll fluido (es. quando si trascina la scrollbar a mano). */
+static void wheel_stop(void)
+{
+    l_wheel_active = FALSE;
+    if (l_wheel_tick && l_scroll) {
+        gtk_widget_remove_tick_callback(l_scroll, l_wheel_tick);
+        l_wheel_tick = 0;
+    }
+}
+
+static gboolean wheel_tick(GtkWidget *w G_GNUC_UNUSED,
+                           GdkFrameClock *clock G_GNUC_UNUSED,
+                           gpointer u G_GNUC_UNUSED)
+{
+    GtkAdjustment *h = scroll_hadj();
+    if (!h) {
+        l_wheel_tick = 0;
+        l_wheel_active = FALSE;
+        return G_SOURCE_REMOVE;
+    }
+    double cur = gtk_adjustment_get_value(h);
+    double d = l_wheel_target - cur;
+    if (fabs(d) < 0.5) {
+        gtk_adjustment_set_value(h, l_wheel_target);
+        l_wheel_tick = 0;
+        l_wheel_active = FALSE;
+        return G_SOURCE_REMOVE;
+    }
+    gtk_adjustment_set_value(h, cur + d * WHEEL_EASE);
+    return G_SOURCE_CONTINUE;
+}
+
+/* Rotellina verticale -> scroll orizzontale fluido (le app vanno verso destra). */
 static gboolean on_scroll(GtkEventControllerScroll *c G_GNUC_UNUSED,
                           double dx, double dy, gpointer scroll)
 {
@@ -392,10 +729,22 @@ static gboolean on_scroll(GtkEventControllerScroll *c G_GNUC_UNUSED,
     if (!h)
         return FALSE;
     double delta = (dy != 0.0) ? dy : dx;
-    double step = gtk_adjustment_get_step_increment(h);
-    if (step <= 0.0)
-        step = 40.0;
-    gtk_adjustment_set_value(h, gtk_adjustment_get_value(h) + delta * step * 3.0);
+    if (delta == 0.0)
+        return FALSE;
+
+    /* Accumula sul target (partendo dalla posizione reale se fermo), clampato. */
+    double lower = gtk_adjustment_get_lower(h);
+    double maxv  = gtk_adjustment_get_upper(h) - gtk_adjustment_get_page_size(h);
+    if (!l_wheel_active)
+        l_wheel_target = gtk_adjustment_get_value(h);
+    l_wheel_target += delta * WHEEL_STEP;
+    if (l_wheel_target < lower) l_wheel_target = lower;
+    if (l_wheel_target > maxv)  l_wheel_target = maxv;
+    l_wheel_active = TRUE;
+
+    if (!l_wheel_tick)
+        l_wheel_tick = gtk_widget_add_tick_callback(l_scroll, wheel_tick,
+                                                    NULL, NULL);
     return TRUE;
 }
 
@@ -504,6 +853,306 @@ static void launcher_refresh_blur(void)
         g_object_unref(tex);
 }
 
+/* ---- Scrollbar orizzontale custom --------------------------------------- */
+
+/* Geometria del cursore per una data larghezza del widget. active=FALSE se non
+ * c'e' overflow (niente da scorrere). */
+typedef struct {
+    double track_x, track_w;   /* traccia                                  */
+    double thumb_x, thumb_w;   /* cursore (thumb_x assoluto)               */
+    double max_x;              /* corsa massima del cursore                */
+    gboolean active;
+} SbGeom;
+
+static GtkAdjustment *sb_hadj(void)
+{
+    if (!l_scroll)
+        return NULL;
+    return gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(l_scroll));
+}
+
+static SbGeom sb_geom(int width)
+{
+    SbGeom g = { 0 };
+    GtkAdjustment *h = sb_hadj();
+    if (!h || width <= 0)
+        return g;
+
+    double lower = gtk_adjustment_get_lower(h);
+    double upper = gtk_adjustment_get_upper(h);
+    double page  = gtk_adjustment_get_page_size(h);
+    double value = gtk_adjustment_get_value(h);
+    double span  = upper - lower;
+    if (span <= page + 0.5 || span <= 0.0)
+        return g;                       /* nessun overflow */
+
+    g.track_x = SB_MARGIN;
+    g.track_w = width - 2.0 * SB_MARGIN;
+    if (g.track_w <= 0.0)
+        return g;
+
+    double thumb_w = g.track_w * (page / span);
+    if (thumb_w < SB_MIN_THUMB) thumb_w = SB_MIN_THUMB;
+    if (thumb_w > g.track_w)    thumb_w = g.track_w;
+    g.thumb_w = thumb_w;
+    g.max_x = g.track_w - thumb_w;
+
+    double denom = span - page;
+    double frac = denom > 0.0 ? (value - lower) / denom : 0.0;
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    g.thumb_x = g.track_x + frac * g.max_x;
+    g.active = TRUE;
+    return g;
+}
+
+/* Percorso di un rettangolo arrotondato (pillola). */
+static void sb_rrect(cairo_t *cr, double x, double y, double w, double h,
+                     double r)
+{
+    if (r > h / 2.0) r = h / 2.0;
+    if (r > w / 2.0) r = w / 2.0;
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - r, y + r,     r, -G_PI / 2.0, 0.0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0.0,         G_PI / 2.0);
+    cairo_arc(cr, x + r,     y + h - r, r, G_PI / 2.0,  G_PI);
+    cairo_arc(cr, x + r,     y + r,     r, G_PI,        G_PI * 1.5);
+    cairo_close_path(cr);
+}
+
+static void sb_draw(GtkDrawingArea *area, cairo_t *cr,
+                    int width, int height, gpointer u G_GNUC_UNUSED)
+{
+    SbGeom g = sb_geom(width);
+    if (!g.active)
+        return;
+
+    double vis = l_sb_show;                       /* dissolvenza complessiva */
+    if (vis <= 0.003)
+        return;                                   /* mouse fuori: invisibile */
+
+    GdkRGBA c;
+    gtk_widget_get_color(GTK_WIDGET(area), &c);
+
+    double t = l_sb_hover;                        /* 0..1 */
+    double thick = SB_THICK + (SB_THICK_MAX - SB_THICK) * t;
+    double y = (height - thick) / 2.0;
+    double r = thick / 2.0;
+
+    /* Traccia: sempre sottile e discreta. */
+    sb_rrect(cr, g.track_x, y, g.track_w, thick, r);
+    cairo_set_source_rgba(cr, c.red, c.green, c.blue, (0.10 + 0.05 * t) * vis);
+    cairo_fill(cr);
+
+    /* Cursore: piu' presente, si accende in hover/drag. */
+    double a = 0.38 + 0.42 * t;
+    if (l_sb_dragging)
+        a = 0.92;
+    sb_rrect(cr, g.thumb_x, y, g.thumb_w, thick, r);
+    cairo_set_source_rgba(cr, c.red, c.green, c.blue, a * vis);
+    cairo_fill(cr);
+}
+
+/* Mostra/nasconde la scrollbar in base all'overflow (indipendente dalla
+ * larghezza gia' allocata) e ridisegna. */
+static void sb_sync(void)
+{
+    if (!l_scrollbar)
+        return;
+    GtkAdjustment *h = sb_hadj();
+    gboolean show = FALSE;
+    if (h) {
+        double span = gtk_adjustment_get_upper(h) - gtk_adjustment_get_lower(h);
+        show = span > gtk_adjustment_get_page_size(h) + 0.5;
+    }
+    gtk_widget_set_visible(l_scrollbar, show);
+    gtk_widget_queue_draw(l_scrollbar);
+}
+
+static void sb_on_adjustment(void)
+{
+    sb_sync();
+}
+
+/* ---- Scrollbar: animazioni (hover del cursore + dissolvenza) ------------- */
+
+/* Avvicina `*val` a `target` di una frazione `k`; TRUE finche' non e' fermo. */
+static gboolean sb_ease(double *val, gboolean target, double k)
+{
+    double t = target ? 1.0 : 0.0;
+    double d = t - *val;
+    if (fabs(d) < 0.01) {
+        *val = t;
+        return FALSE;
+    }
+    *val += d * k;
+    return TRUE;
+}
+
+static gboolean sb_anim_cb(GtkWidget *w, GdkFrameClock *clock G_GNUC_UNUSED,
+                           gpointer u G_GNUC_UNUSED)
+{
+    gboolean running = FALSE;
+    running |= sb_ease(&l_sb_hover, l_sb_hover_target, 0.22);
+    running |= sb_ease(&l_sb_show,  l_sb_show_target,  0.18);
+    gtk_widget_queue_draw(w);
+    if (!running) {
+        l_sb_anim = 0;
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void sb_kick_anim(void)
+{
+    if (!l_sb_anim && l_scrollbar)
+        l_sb_anim = gtk_widget_add_tick_callback(l_scrollbar, sb_anim_cb,
+                                                 NULL, NULL);
+}
+
+static void sb_set_hover(gboolean on)
+{
+    l_sb_hover_target = on;
+    sb_kick_anim();
+}
+
+static void sb_set_show(gboolean on)
+{
+    l_sb_show_target = on;
+    sb_kick_anim();
+}
+
+/* Puntatore sopra/fuori la scrollbar stessa: solo l'ingrossamento del cursore. */
+static void sb_on_enter(GtkEventControllerMotion *c G_GNUC_UNUSED,
+                        double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
+                        gpointer u G_GNUC_UNUSED)
+{
+    l_sb_inside = TRUE;
+    sb_set_hover(TRUE);
+}
+
+static void sb_on_leave(GtkEventControllerMotion *c G_GNUC_UNUSED,
+                        gpointer u G_GNUC_UNUSED)
+{
+    l_sb_inside = FALSE;
+    if (!l_sb_dragging)
+        sb_set_hover(FALSE);
+}
+
+/* Puntatore sopra/fuori il pannello del launcher: mostra/nasconde la scrollbar. */
+static void sb_on_launcher_enter(GtkEventControllerMotion *c G_GNUC_UNUSED,
+                                 double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
+                                 gpointer u G_GNUC_UNUSED)
+{
+    l_over_launcher = TRUE;
+    sb_set_show(TRUE);
+}
+
+static void sb_on_launcher_leave(GtkEventControllerMotion *c G_GNUC_UNUSED,
+                                 gpointer u G_GNUC_UNUSED)
+{
+    l_over_launcher = FALSE;
+    if (!l_sb_dragging)
+        sb_set_show(FALSE);
+}
+
+/* ---- Scrollbar: trascinamento ------------------------------------------- */
+
+/* Porta il bordo sinistro del cursore a `thumb_left` (assoluto), aggiornando
+ * l'adjustment. */
+static void sb_apply_thumb_left(double thumb_left, SbGeom g)
+{
+    if (!g.active || g.max_x <= 0.0)
+        return;
+    double lo = g.track_x, hi = g.track_x + g.max_x;
+    if (thumb_left < lo) thumb_left = lo;
+    if (thumb_left > hi) thumb_left = hi;
+
+    GtkAdjustment *h = sb_hadj();
+    if (!h)
+        return;
+    double lower = gtk_adjustment_get_lower(h);
+    double upper = gtk_adjustment_get_upper(h);
+    double page  = gtk_adjustment_get_page_size(h);
+    double frac  = (thumb_left - g.track_x) / g.max_x;
+    gtk_adjustment_set_value(h, lower + frac * ((upper - lower) - page));
+}
+
+static void sb_drag_begin(GtkGestureDrag *gesture G_GNUC_UNUSED,
+                          double start_x, double start_y G_GNUC_UNUSED,
+                          gpointer u G_GNUC_UNUSED)
+{
+    SbGeom g = sb_geom(gtk_widget_get_width(l_scrollbar));
+    if (!g.active)
+        return;
+    wheel_stop();               /* la mano vince sull'inerzia della rotellina */
+    l_sb_dragging = TRUE;
+    sb_set_hover(TRUE);
+
+    if (start_x >= g.thumb_x && start_x <= g.thumb_x + g.thumb_w) {
+        /* Presa sul cursore: trascinamento relativo. */
+        l_sb_grab_offset = start_x - g.thumb_x;
+    } else {
+        /* Presa sulla traccia: il cursore si centra sotto il puntatore. */
+        l_sb_grab_offset = g.thumb_w / 2.0;
+        sb_apply_thumb_left(start_x - l_sb_grab_offset, g);
+    }
+    gtk_widget_queue_draw(l_scrollbar);
+}
+
+static void sb_drag_update(GtkGestureDrag *gesture, double off_x,
+                           double off_y G_GNUC_UNUSED, gpointer u G_GNUC_UNUSED)
+{
+    double start_x = 0.0;
+    gtk_gesture_drag_get_start_point(gesture, &start_x, NULL);
+    SbGeom g = sb_geom(gtk_widget_get_width(l_scrollbar));
+    if (!g.active)
+        return;
+    sb_apply_thumb_left((start_x + off_x) - l_sb_grab_offset, g);
+}
+
+static void sb_drag_end(GtkGestureDrag *gesture G_GNUC_UNUSED,
+                        double off_x G_GNUC_UNUSED, double off_y G_GNUC_UNUSED,
+                        gpointer u G_GNUC_UNUSED)
+{
+    l_sb_dragging = FALSE;
+    sb_set_hover(l_sb_inside);
+    sb_set_show(l_over_launcher || l_sb_inside);
+    gtk_widget_queue_draw(l_scrollbar);
+}
+
+/* Costruisce il widget scrollbar e lo collega all'hadjustment della griglia. */
+static GtkWidget *build_scrollbar(void)
+{
+    GtkWidget *sb = gtk_drawing_area_new();
+    l_scrollbar = sb;
+    gtk_widget_add_css_class(sb, "launcher-scrollbar");
+    gtk_widget_set_hexpand(sb, TRUE);
+    gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(sb), 14);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(sb), sb_draw, NULL, NULL);
+    gtk_widget_set_visible(sb, FALSE);
+
+    GtkEventController *motion = gtk_event_controller_motion_new();
+    g_signal_connect(motion, "enter", G_CALLBACK(sb_on_enter), NULL);
+    g_signal_connect(motion, "leave", G_CALLBACK(sb_on_leave), NULL);
+    gtk_widget_add_controller(sb, motion);
+
+    GtkGesture *drag = gtk_gesture_drag_new();
+    g_signal_connect(drag, "drag-begin",  G_CALLBACK(sb_drag_begin), NULL);
+    g_signal_connect(drag, "drag-update", G_CALLBACK(sb_drag_update), NULL);
+    g_signal_connect(drag, "drag-end",    G_CALLBACK(sb_drag_end), NULL);
+    gtk_widget_add_controller(sb, GTK_EVENT_CONTROLLER(drag));
+
+    GtkAdjustment *h = sb_hadj();
+    if (h) {
+        g_signal_connect(h, "changed",
+                         G_CALLBACK(sb_on_adjustment), NULL);
+        g_signal_connect(h, "value-changed",
+                         G_CALLBACK(sb_on_adjustment), NULL);
+    }
+    return sb;
+}
+
 /* ---- Costruzione popup -------------------------------------------------- */
 
 static void build_popup(void)
@@ -565,10 +1214,20 @@ static void build_popup(void)
     gtk_widget_set_valign(panel, GTK_ALIGN_CENTER);
     gtk_overlay_add_overlay(GTK_OVERLAY(backdrop), panel);
 
+    /* La scrollbar custom compare solo col puntatore sopra il launcher. */
+    GtkEventController *pm = gtk_event_controller_motion_new();
+    g_signal_connect(pm, "enter", G_CALLBACK(sb_on_launcher_enter), NULL);
+    g_signal_connect(pm, "leave", G_CALLBACK(sb_on_launcher_leave), NULL);
+    gtk_widget_add_controller(panel, pm);
+
     /* Barra di ricerca. */
     l_search = gtk_search_entry_new();
     gtk_widget_add_css_class(l_search, "launcher-search");
     gtk_widget_set_hexpand(l_search, TRUE);
+    /* Nessun debounce: "search-changed" scatta a OGNI lettera, cosi' la
+     * griglia si aggiorna istantaneamente mentre si digita (di default
+     * GtkSearchEntry aspetta ~150ms, dando la sensazione di lag). */
+    gtk_search_entry_set_search_delay(GTK_SEARCH_ENTRY(l_search), 0);
     gtk_box_append(GTK_BOX(panel), l_search);
     g_signal_connect(l_search, "search-changed",
                      G_CALLBACK(on_search_changed), NULL);
@@ -584,8 +1243,10 @@ static void build_popup(void)
      * orizzontale (flowbox in orientamento VERTICALE = righe per colonna). */
     GtkWidget *scroll = gtk_scrolled_window_new();
     l_scroll = scroll;
+    /* EXTERNAL: nessuna scrollbar di GTK; la disegniamo noi (build_scrollbar)
+     * mantenendo comunque attivo lo scorrimento dell'adjustment. */
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+                                   GTK_POLICY_EXTERNAL, GTK_POLICY_NEVER);
     gtk_widget_set_size_request(scroll,
                                 GRID_COLS * (CELL_W + 14) + (GRID_COLS - 1) * 10,
                                 GRID_ROWS * (CELL_H + 14) + (GRID_ROWS - 1) * 10);
@@ -616,7 +1277,19 @@ static void build_popup(void)
     g_signal_connect(sc, "scroll", G_CALLBACK(on_scroll), scroll);
     gtk_widget_add_controller(scroll, sc);
 
+    /* Scrollbar orizzontale disegnata da noi, sotto la griglia. */
+    gtk_box_append(GTK_BOX(panel), build_scrollbar());
+
+    usage_init();               /* cache d'uso caricata prima di ordinare */
+    l_cells = g_ptr_array_new();
+    l_fillers = g_ptr_array_new();
     populate_grid();
+
+    /* Segue le installazioni/rimozioni di app a runtime: la griglia si
+     * aggiorna senza riavviare la shell. */
+    l_app_monitor = g_app_info_monitor_get();
+    g_signal_connect(l_app_monitor, "changed",
+                     G_CALLBACK(on_apps_changed), NULL);
 
     /* Escape chiude. Fase CAPTURE: il popup vede il tasto PRIMA del campo di
      * ricerca (che ha il focus e altrimenti "mangerebbe" Escape), cosi' ESC
@@ -670,13 +1343,27 @@ static void on_toggle(GtkButton *b G_GNUC_UNUSED, gpointer u G_GNUC_UNUSED)
     gtk_editable_set_text(GTK_EDITABLE(l_search), "");
     g_free(l_query);
     l_query = NULL;
-    search_reset();
+
+    /* La scrollbar riparte nascosta: si mostrera' quando il puntatore entra
+     * nel pannello (enter del motion controller). */
+    l_over_launcher = FALSE;
+    l_sb_show = 0.0;
+    l_sb_show_target = FALSE;
+    l_sb_hover = 0.0;
+    l_sb_hover_target = FALSE;
+    wheel_stop();               /* nessuna inerzia residua dall'apertura prima */
+
+    /* App cambiate mentre il launcher era chiuso: rigenera ora, cosi' si apre
+     * gia' aggiornato. (rebuild_grid azzera anche lo stato di ricerca.) */
+    if (l_dirty)
+        rebuild_grid();
+    else
+        search_reset();
 
     /* Rigenera lo sfondo sfocato dal wallpaper corrente (segue l'hot-reload). */
     launcher_refresh_blur();
 
-    if (l_button)
-        gtk_widget_add_css_class(l_button, "active");
+    buttons_set_active(TRUE);
     gtk_widget_add_css_class(l_backdrop, "opening");
     gtk_widget_add_css_class(l_panel, "opening");
     gtk_window_present(GTK_WINDOW(l_popup));
@@ -694,13 +1381,28 @@ static void test_open_once(gpointer btn)
     on_toggle(GTK_BUTTON(btn), NULL);
 }
 
+/* Un tasto distrutto (barra chiusa): toglilo dalla lista. */
+static void on_button_destroy(gpointer data, GObject *where)
+{
+    if (l_buttons)
+        g_ptr_array_remove_fast(l_buttons, where);
+    (void) data;
+}
+
 GtkWidget *launcher_button_new(void)
 {
     GtkWidget *btn = gtk_button_new();
-    l_button = btn;
+    if (!l_buttons)
+        l_buttons = g_ptr_array_new();
+    g_ptr_array_add(l_buttons, btn);
+    g_object_weak_ref(G_OBJECT(btn), on_button_destroy, NULL);
     gtk_widget_add_css_class(btn, "launcher-btn");
     gtk_widget_set_focusable(btn, FALSE);
     gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
+
+    /* Se il launcher e' gia' aperto (barra aggiunta a caldo), riflettilo. */
+    if (l_popup && gtk_widget_get_visible(l_popup) && !l_close_timer)
+        gtk_widget_add_css_class(btn, "active");
 
     GtkWidget *dot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_add_css_class(dot, "launcher-dot");

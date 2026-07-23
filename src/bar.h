@@ -12,8 +12,9 @@
  * desktop, evitando lo stacco netto al bordo inferiore della barra. */
 #define SFSHELL_BAR_SHADOW 8
 
-/* Crea la top bar come layer-surface ancorata in alto sul monitor.
- * La window ritornata e' gia' configurata per gtk4-layer-shell. */
-GtkWindow *bar_new(GtkApplication *app);
+/* Crea la top bar come layer-surface ancorata in alto sul monitor indicato.
+ * `monitor` fissa l'output su cui compare la barra (NULL = lascia scegliere al
+ * compositor). La window ritornata e' gia' configurata per gtk4-layer-shell. */
+GtkWindow *bar_new(GtkApplication *app, GdkMonitor *monitor);
 
 #endif /* SFSHELL_BAR_H */

@@ -28,6 +28,11 @@ static const char *CONF_DEFAULT =
     "# true = visibile (default), false = barra su fondo trasparente.\n"
     "bar_shadow = true\n"
     "\n"
+    "# bar_text_shadow: ombra sotto TUTTO il testo della barra (orologio,\n"
+    "# workspace, tray), per staccarlo dallo sfondo. true = ombra (default),\n"
+    "# false = testo senza ombra.\n"
+    "bar_text_shadow = true\n"
+    "\n"
     "# --- Orologio ---\n"
     "# clock_format: 24h (es. 19:31) oppure 12h (es. 7:31 PM). Default 24h.\n"
     "# clock_ampm: stile del suffisso mattino/pomeriggio, usato solo con 12h.\n"
@@ -263,19 +268,26 @@ static gboolean conf_get_bool(const char *key, gboolean fallback)
            g_ascii_strcasecmp(v, "yes")  == 0;
 }
 
-/* Gradiente/ombra dietro la top bar (.bar-backdrop): attivo di default. Con
- * `bar_shadow = false` in sfshell.conf lo togliamo, sovrascrivendo lo sfondo
- * del backdrop con "nessuno" (barra su fondo pienamente trasparente). */
-static void apply_bar_shadow(void)
+/* CSS hot della barra (sopra il CSS base): raccoglie gli override opzionali.
+ *  - bar_shadow = false      -> toglie il gradiente/ombra dietro la barra;
+ *  - bar_text_shadow = false -> toglie l'ombra sotto il testo della barra.
+ * Entrambi attivi di default: con i default la stringa resta vuota e vale il
+ * CSS base embeddato. */
+static void apply_bar_css(void)
 {
     if (!bar_provider)
         return;
-    if (conf_get_bool("bar_shadow", TRUE))
-        gtk_css_provider_load_from_string(bar_provider, "");   /* usa il default */
-    else
-        gtk_css_provider_load_from_string(bar_provider,
+
+    GString *css = g_string_new(NULL);
+    if (!conf_get_bool("bar_shadow", TRUE))
+        g_string_append(css,
             ".bar-backdrop { background-image: none;"
             " background-color: transparent; }");
+    if (!conf_get_bool("bar_text_shadow", TRUE))
+        g_string_append(css, ".bar { text-shadow: none; }");
+
+    gtk_css_provider_load_from_string(bar_provider, css->str);
+    g_string_free(css, TRUE);
 }
 
 void config_reload(void)
@@ -283,7 +295,7 @@ void config_reload(void)
     parse_file();
     apply_icon_theme();
     apply_overlay();
-    apply_bar_shadow();
+    apply_bar_css();
 }
 
 void config_init(void)

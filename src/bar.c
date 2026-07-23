@@ -100,13 +100,17 @@ static GtkWidget *build_clock_pill(void)
 
 /* ---- Bar ---------------------------------------------------------------- */
 
-GtkWindow *bar_new(GtkApplication *app)
+GtkWindow *bar_new(GtkApplication *app, GdkMonitor *monitor)
 {
     GtkWidget *win = gtk_application_window_new(app);
     gtk_widget_add_css_class(win, "bar-window");
 
     /* Layer shell: barra ancorata in alto, riservando spazio (exclusive). */
     gtk_layer_init_for_window(GTK_WINDOW(win));
+    /* Fissa l'output: senza questo il compositor sceglierebbe lui il monitor,
+     * mettendo tutte le barre sullo stesso. */
+    if (monitor)
+        gtk_layer_set_monitor(GTK_WINDOW(win), monitor);
     /* OVERLAY (sopra il velo del launcher, che sta su TOP): cosi' il velo
      * scuro passa ANCHE sotto la barra e la barra resta visibile sopra, con
      * la sua ombra che si stacca sul velo. */

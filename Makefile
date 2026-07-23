@@ -1,5 +1,5 @@
 CC      ?= gcc
-PKGS     = gtk4 gtk4-layer-shell-0 json-glib-1.0 fontconfig
+PKGS     = gtk4 gtk4-layer-shell-0 json-glib-1.0 fontconfig gio-unix-2.0
 
 # Percorsi di installazione. PREFIX e DESTDIR sono sovrascrivibili:
 #   make install                 -> /usr/bin/sfshell, /usr/share/sfshell/fonts

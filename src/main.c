@@ -146,6 +146,11 @@ static const char *DEFAULT_CSS =
     "  font-family: \"Material Symbols Rounded\";\n"
     "  font-size: 15px;\n"
     "}\n"
+    "/* skip_previous / skip_next: glifi otticamente piu' piccoli del\n"
+    "   play/pausa, li ingrandisco un filo per pareggiarli. */\n"
+    ".media-icon.media-skip {\n"
+    "  font-size: 18px;\n"
+    "}\n"
     ".media-btn {\n"
     "  all: unset;\n"
     "  padding: 0 1px;\n"
@@ -156,7 +161,7 @@ static const char *DEFAULT_CSS =
     "}\n"
     "\n"
     "/* ---- App launcher ---- */\n"
-    "/* Bottone nella barra: cerchietto pieno. */\n"
+    "/* Bottone nella barra: cerchietto vuoto (pallino vuoto dentro). */\n"
     ".launcher-btn {\n"
     "  all: unset;\n"
     "  padding: 0 6px;\n"
@@ -165,17 +170,18 @@ static const char *DEFAULT_CSS =
     "  min-width: 12px;\n"
     "  min-height: 12px;\n"
     "  border-radius: 9999px;\n"
-    "  background-color: alpha(@theme_fg_color, 0.85);\n"
-    "  transition: background-color 140ms ease, transform 140ms ease;\n"
+    "  background-color: transparent;\n"
+    "  box-shadow: inset 0 0 0 2px alpha(@theme_fg_color, 0.85);\n"
+    "  transition: background-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;\n"
     "}\n"
     ".launcher-btn:hover .launcher-dot {\n"
-    "  background-color: @theme_selected_bg_color;\n"
+    "  box-shadow: inset 0 0 0 2px @theme_selected_bg_color;\n"
     "  transform: scale(1.12);\n"
     "}\n"
     "/* Launcher aperto: pallino sempre nel colore active dominante,\n"
     "   a prescindere dall'hover (stato .active messo dal toggle). */\n"
     ".launcher-btn.active .launcher-dot {\n"
-    "  background-color: @theme_selected_bg_color;\n"
+    "  box-shadow: inset 0 0 0 2px @theme_selected_bg_color;\n"
     "  transform: scale(1.12);\n"
     "}\n"
     "\n"
@@ -260,6 +266,13 @@ static const char *DEFAULT_CSS =
     ".launcher-label {\n"
     "  color: @theme_fg_color;\n"
     "  font-size: 12px;\n"
+    "}\n"
+    "\n"
+    "/* Scrollbar orizzontale custom (disegnata in cairo): il colore del testo\n"
+    "   fa da tinta di traccia/cursore, con un filo di respiro sopra/sotto. */\n"
+    ".launcher-scrollbar {\n"
+    "  color: @theme_fg_color;\n"
+    "  margin: -10px 6px 0 6px;\n"   /* margine negativo: avvicina alla griglia */
     "}\n";
 
 static void on_config_changed(GFileMonitor *monitor G_GNUC_UNUSED,
@@ -321,6 +334,63 @@ static void setup_style(void)
  * nell'istanza primaria. */
 static gboolean shell_up = FALSE;
 
+/* Una barra per monitor. Teniamo la mappa monitor -> window per aggiungere/
+ * togliere barre quando gli output vengono collegati/scollegati a caldo. */
+static GtkApplication *shell_app;
+static GHashTable     *shell_bars;   /* GdkMonitor* -> GtkWindow* */
+
+static void spawn_bar_for_monitor(GdkMonitor *monitor)
+{
+    if (!monitor || g_hash_table_contains(shell_bars, monitor))
+        return;
+    GtkWindow *bar = bar_new(shell_app, monitor);
+    /* Il connector (es. "DP-1") combacia col nome monitor di Hyprland. */
+    fullscreen_register(bar, gdk_monitor_get_connector(monitor));
+    g_hash_table_insert(shell_bars, monitor, bar);
+}
+
+/* Riconcilia le barre coi monitor presenti: crea quelle mancanti, distrugge
+ * quelle di output spariti. */
+static void sync_monitors(GListModel *monitors)
+{
+    /* Set dei monitor attualmente presenti. */
+    GHashTable *present = g_hash_table_new(g_direct_hash, g_direct_equal);
+    guint n = g_list_model_get_n_items(monitors);
+    for (guint i = 0; i < n; i++) {
+        GdkMonitor *mon = g_list_model_get_item(monitors, i);
+        g_hash_table_add(present, mon);
+        spawn_bar_for_monitor(mon);
+        g_object_unref(mon);       /* la hash tiene solo il puntatore */
+    }
+
+    /* Rimuovi le barre dei monitor non piu' presenti. */
+    GHashTableIter it;
+    gpointer key, val;
+    GPtrArray *stale = g_ptr_array_new();
+    g_hash_table_iter_init(&it, shell_bars);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+        if (!g_hash_table_contains(present, key))
+            g_ptr_array_add(stale, key);
+    }
+    for (guint i = 0; i < stale->len; i++) {
+        GtkWindow *bar = g_hash_table_lookup(shell_bars, stale->pdata[i]);
+        g_hash_table_remove(shell_bars, stale->pdata[i]);
+        if (bar)
+            gtk_window_destroy(bar);   /* la de-registrazione avviene via weak-ref */
+    }
+    g_ptr_array_free(stale, TRUE);
+    g_hash_table_destroy(present);
+}
+
+static void on_monitors_changed(GListModel *monitors,
+                                guint position G_GNUC_UNUSED,
+                                guint removed G_GNUC_UNUSED,
+                                guint added G_GNUC_UNUSED,
+                                gpointer user_data G_GNUC_UNUSED)
+{
+    sync_monitors(monitors);
+}
+
 static void build_shell(GtkApplication *app)
 {
     if (shell_up)
@@ -329,8 +399,18 @@ static void build_shell(GtkApplication *app)
     setup_style();
     colors_init();          /* palette dai wallpaper (se abilitata) */
     wallpaper_init();
-    GtkWindow *bar = bar_new(app);
-    fullscreen_watch(bar);  /* nasconde la barra sotto app fullscreen */
+
+    shell_app  = app;
+    shell_bars = g_hash_table_new(g_direct_hash, g_direct_equal);
+
+    /* Una barra su OGNI monitor; nasconde la barra sotto app fullscreen,
+     * per-monitor. Segue il collegamento/scollegamento a caldo degli output. */
+    GdkDisplay *display = gdk_display_get_default();
+    GListModel *monitors = gdk_display_get_monitors(display);
+    sync_monitors(monitors);
+    g_signal_connect(monitors, "items-changed",
+                     G_CALLBACK(on_monitors_changed), NULL);
+
     shell_up = TRUE;
 }
 

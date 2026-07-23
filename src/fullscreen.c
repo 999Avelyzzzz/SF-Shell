@@ -4,15 +4,25 @@
 #include <gio/gunixsocketaddress.h>
 #include <string.h>
 
+/* Una barra registrata: la window, il connector del suo monitor e lo stato
+ * corrente (nascosta o no), per evitare set_visible ridondanti. */
 typedef struct {
     GtkWindow *bar;
+    char      *connector;
+    gboolean   hidden;
+} BarEntry;
+
+/* Watcher unico condiviso da tutte le barre. */
+typedef struct {
     char      *cmd_path;   /* .socket.sock  (richiesta/risposta) */
     char      *evt_path;   /* .socket2.sock (stream di eventi)   */
     GSocket   *evt_sock;   /* tenuta viva: possiede l'fd eventi  */
     GSource   *evt_source;
     GString   *evt_buf;    /* accumulo per righe spezzate        */
-    gboolean   hidden;     /* stato corrente della barra         */
+    GPtrArray *bars;       /* BarEntry*                          */
 } Fullscreen;
+
+static Fullscreen *g_fs;
 
 /* ---- IPC (helper locali, gemelli di quelli in workspaces.c) ------------- */
 
@@ -52,42 +62,104 @@ static char *hypr_request(const char *cmd_path, const char *request)
     return result;
 }
 
-/* ---- Stato fullscreen --------------------------------------------------- */
+/* ---- Stato fullscreen per-monitor --------------------------------------- */
 
-/* TRUE se la finestra attiva e' a schermo intero "vero" (mode 2). La
- * massimizzazione (mode 1) rispetta lo spazio riservato alla barra, quindi non
- * la nasconde. Se non c'e' finestra attiva, activewindow risponde "{}" e
- * l'assenza del campo "fullscreen" vale 0 -> non fullscreen. */
-static gboolean active_is_fullscreen(Fullscreen *fs)
+/* Insieme degli id di workspace che ospitano una finestra a schermo intero
+ * "vero" (mode 2). La massimizzazione (mode 1) rispetta lo spazio della barra,
+ * quindi non conta. Ritorna una GHashTable<int,gboolean> (chiavi = id ws). */
+static GHashTable *fullscreen_workspaces(Fullscreen *fs)
 {
-    char *json = hypr_request(fs->cmd_path, "j/activewindow");
+    GHashTable *set = g_hash_table_new(g_direct_hash, g_direct_equal);
+    char *json = hypr_request(fs->cmd_path, "j/clients");
     if (!json)
-        return FALSE;
+        return set;
 
-    gboolean full = FALSE;
     JsonParser *p = json_parser_new();
     if (json_parser_load_from_data(p, json, -1, NULL)) {
         JsonNode *root = json_parser_get_root(p);
-        if (root && JSON_NODE_HOLDS_OBJECT(root)) {
-            JsonObject *obj = json_node_get_object(root);
-            if (obj && json_object_has_member(obj, "fullscreen"))
-                full = json_object_get_int_member(obj, "fullscreen") >= 2;
+        JsonArray *arr = root && JSON_NODE_HOLDS_ARRAY(root)
+                         ? json_node_get_array(root) : NULL;
+        guint len = arr ? json_array_get_length(arr) : 0;
+        for (guint i = 0; i < len; i++) {
+            JsonObject *o = json_array_get_object_element(arr, i);
+            if (!o || !json_object_has_member(o, "fullscreen"))
+                continue;
+            if (json_object_get_int_member(o, "fullscreen") < 2)
+                continue;
+            JsonObject *ws = json_object_has_member(o, "workspace")
+                ? json_object_get_object_member(o, "workspace") : NULL;
+            if (ws && json_object_has_member(ws, "id")) {
+                int id = (int) json_object_get_int_member(ws, "id");
+                g_hash_table_add(set, GINT_TO_POINTER(id));
+            }
         }
     }
     g_object_unref(p);
     g_free(json);
-    return full;
+    return set;
 }
 
-/* Mostra/nasconde la barra rimappando la layer-surface: nascondendola libera
- * anche la exclusive zone, cosi' l'app riottiene tutto lo schermo. */
+/* Mappa connector(monitor) -> gboolean "deve nascondere la barra". Costruita
+ * incrociando i monitor (workspace attivo di ciascuno) con l'insieme dei
+ * workspace fullscreen. Ritorna GHashTable<string,gboolean> da distruggere. */
+static GHashTable *hidden_by_connector(Fullscreen *fs)
+{
+    GHashTable *out = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                            g_free, NULL);
+    GHashTable *full_ws = fullscreen_workspaces(fs);
+
+    char *json = hypr_request(fs->cmd_path, "j/monitors");
+    if (json) {
+        JsonParser *p = json_parser_new();
+        if (json_parser_load_from_data(p, json, -1, NULL)) {
+            JsonNode *root = json_parser_get_root(p);
+            JsonArray *arr = root && JSON_NODE_HOLDS_ARRAY(root)
+                             ? json_node_get_array(root) : NULL;
+            guint len = arr ? json_array_get_length(arr) : 0;
+            for (guint i = 0; i < len; i++) {
+                JsonObject *o = json_array_get_object_element(arr, i);
+                if (!o || !json_object_has_member(o, "name"))
+                    continue;
+                const char *name = json_object_get_string_member(o, "name");
+                JsonObject *aw = json_object_has_member(o, "activeWorkspace")
+                    ? json_object_get_object_member(o, "activeWorkspace") : NULL;
+                int wsid = (aw && json_object_has_member(aw, "id"))
+                    ? (int) json_object_get_int_member(aw, "id") : 0;
+                gboolean hide = g_hash_table_contains(full_ws,
+                                                      GINT_TO_POINTER(wsid));
+                g_hash_table_insert(out, g_strdup(name),
+                                    GINT_TO_POINTER(hide));
+            }
+        }
+        g_object_unref(p);
+        g_free(json);
+    }
+
+    g_hash_table_destroy(full_ws);
+    return out;
+}
+
+/* Ricalcola lo stato e aggiorna la visibilita' di ogni barra registrata. */
 static void apply_state(Fullscreen *fs)
 {
-    gboolean want_hidden = active_is_fullscreen(fs);
-    if (want_hidden == fs->hidden)
+    if (!fs->bars || fs->bars->len == 0)
         return;
-    fs->hidden = want_hidden;
-    gtk_widget_set_visible(GTK_WIDGET(fs->bar), !want_hidden);
+
+    GHashTable *hide = hidden_by_connector(fs);
+    for (guint i = 0; i < fs->bars->len; i++) {
+        BarEntry *e = fs->bars->pdata[i];
+        gpointer v = NULL;
+        gboolean want_hidden = FALSE;
+        /* Se il connector non compare (monitor non trovato) resta visibile. */
+        if (e->connector &&
+            g_hash_table_lookup_extended(hide, e->connector, NULL, &v))
+            want_hidden = GPOINTER_TO_INT(v);
+        if (want_hidden != e->hidden) {
+            e->hidden = want_hidden;
+            gtk_widget_set_visible(GTK_WIDGET(e->bar), !want_hidden);
+        }
+    }
+    g_hash_table_destroy(hide);
 }
 
 /* ---- Socket eventi ------------------------------------------------------ */
@@ -101,6 +173,7 @@ static gboolean event_is_relevant(const char *line)
         "workspace", "workspacev2",
         "focusedmon", "openwindow", "closewindow", "movewindowv2",
         "changefloatingmode",
+        "monitoradded", "monitorremoved",
         NULL
     };
     for (int i = 0; events[i]; i++) {
@@ -165,33 +238,52 @@ static void event_socket_connect(Fullscreen *fs)
 
 /* ---- Ciclo di vita ------------------------------------------------------ */
 
-static void fullscreen_free(gpointer data, GObject *where G_GNUC_UNUSED)
+static Fullscreen *fullscreen_ensure(void)
 {
-    Fullscreen *fs = data;
-    if (fs->evt_source) {
-        g_source_destroy(fs->evt_source);
-        g_source_unref(fs->evt_source);
-    }
-    if (fs->evt_sock) {
-        g_socket_close(fs->evt_sock, NULL);
-        g_object_unref(fs->evt_sock);
-    }
-    if (fs->evt_buf)
-        g_string_free(fs->evt_buf, TRUE);
-    g_free(fs->cmd_path);
-    g_free(fs->evt_path);
-    g_free(fs);
+    if (g_fs)
+        return g_fs;
+    g_fs = g_new0(Fullscreen, 1);
+    g_fs->cmd_path = hypr_socket_path(".socket.sock");
+    g_fs->evt_path = hypr_socket_path(".socket2.sock");
+    g_fs->bars     = g_ptr_array_new();
+    event_socket_connect(g_fs);
+    return g_fs;
 }
 
-void fullscreen_watch(GtkWindow *bar)
+static void bar_entry_free(BarEntry *e)
 {
-    Fullscreen *fs = g_new0(Fullscreen, 1);
-    fs->bar      = bar;
-    fs->cmd_path = hypr_socket_path(".socket.sock");
-    fs->evt_path = hypr_socket_path(".socket2.sock");
+    g_free(e->connector);
+    g_free(e);
+}
 
-    apply_state(fs);            /* stato iniziale */
-    event_socket_connect(fs);
+/* La barra e' stata distrutta: rimuovi la sua entry. */
+static void on_bar_destroyed(gpointer data, GObject *where)
+{
+    Fullscreen *fs = g_fs;
+    if (!fs)
+        return;
+    for (guint i = 0; i < fs->bars->len; i++) {
+        BarEntry *e = fs->bars->pdata[i];
+        if (e->bar == (GtkWindow *) where) {
+            bar_entry_free(e);
+            g_ptr_array_remove_index_fast(fs->bars, i);
+            break;
+        }
+    }
+    (void) data;
+}
 
-    g_object_weak_ref(G_OBJECT(bar), fullscreen_free, fs);
+void fullscreen_register(GtkWindow *bar, const char *connector)
+{
+    Fullscreen *fs = fullscreen_ensure();
+
+    BarEntry *e = g_new0(BarEntry, 1);
+    e->bar       = bar;
+    e->connector = g_strdup(connector);
+    e->hidden    = FALSE;
+    g_ptr_array_add(fs->bars, e);
+
+    g_object_weak_ref(G_OBJECT(bar), on_bar_destroyed, NULL);
+
+    apply_state(fs);            /* stato iniziale di questa barra */
 }
